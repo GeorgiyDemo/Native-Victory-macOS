@@ -18,14 +18,17 @@ fn covering(sorted: &[Func], rva: u32) -> bool {
 }
 
 fn section_end(img: &Image, rva: u32) -> u32 {
-    img.section_of(rva).map_or(rva, |s| s.rva + s.virtual_size.min(s.file_size.max(1)))
+    img.section_of(rva)
+        .map_or(rva, |s| s.rva + s.virtual_size.min(s.file_size.max(1)))
 }
 
 /// Walks from `start` (not past `limit`) and returns the end of the function and
 /// the direct branch/call targets seen.
 fn walk(img: &Image, start: u32, limit: u32) -> (u32, Vec<u32>) {
     let base = img.info.image_base;
-    let Some(code) = img.bytes(start, (limit - start) as usize) else { return (start, vec![]) };
+    let Some(code) = img.bytes(start, (limit - start) as usize) else {
+        return (start, vec![]);
+    };
     let mut dec = Decoder::with_ip(64, code, base + start as u64, DecoderOptions::NONE);
     let mut max_fwd = start;
     let mut targets = vec![];
@@ -49,8 +52,10 @@ fn walk(img: &Image, start: u32, limit: u32) -> (u32, Vec<u32>) {
             }
             _ => {}
         }
-        let terminal = matches!(i.flow_control(), FlowControl::Return | FlowControl::UnconditionalBranch | FlowControl::IndirectBranch)
-            || matches!(i.mnemonic(), Mnemonic::Int3 | Mnemonic::Ud2);
+        let terminal = matches!(
+            i.flow_control(),
+            FlowControl::Return | FlowControl::UnconditionalBranch | FlowControl::IndirectBranch
+        ) || matches!(i.mnemonic(), Mnemonic::Int3 | Mnemonic::Ud2);
         if terminal && end > max_fwd {
             break;
         }
@@ -88,19 +93,35 @@ pub fn discover(img: &Image) -> anyhow::Result<Vec<Func>> {
         if !img.is_exec(t) || covering(&known, t) || !starts.insert(t) {
             continue;
         }
-        let limit = starts.range(t + 1..).next().copied().unwrap_or(u32::MAX).min(section_end(img, t));
-        let next_known = known[known.partition_point(|f| f.begin <= t)..].first().map_or(u32::MAX, |f| f.begin);
+        let limit = starts
+            .range(t + 1..)
+            .next()
+            .copied()
+            .unwrap_or(u32::MAX)
+            .min(section_end(img, t));
+        let next_known = known[known.partition_point(|f| f.begin <= t)..]
+            .first()
+            .map_or(u32::MAX, |f| f.begin);
         let (_, targets) = walk(img, t, limit.min(next_known));
         pending.extend(targets);
         gap.push(t);
     }
     // Final extents with every start known.
-    let all: BTreeSet<u32> = known.iter().map(|f| f.begin).chain(gap.iter().copied()).collect();
+    let all: BTreeSet<u32> = known
+        .iter()
+        .map(|f| f.begin)
+        .chain(gap.iter().copied())
+        .collect();
     for &t in &gap {
         let next = all.range(t + 1..).next().copied().unwrap_or(u32::MAX);
         let (end, _) = walk(img, t, next.min(section_end(img, t)));
         if end > t {
-            known.push(Func { begin: t, end, unwind: 0, chained: false });
+            known.push(Func {
+                begin: t,
+                end,
+                unwind: 0,
+                chained: false,
+            });
         }
     }
     known.sort_by_key(|f| f.begin);

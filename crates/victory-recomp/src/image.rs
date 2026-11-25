@@ -26,17 +26,22 @@ pub struct Image<'a> {
 
 impl<'a> Image<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
-        Ok(Self { data, info: ImageInfo::parse(data)? })
+        Ok(Self {
+            data,
+            info: ImageInfo::parse(data)?,
+        })
     }
 
     pub fn section_of(&self, rva: u32) -> Option<&SectionInfo> {
         self.info.sections.iter().find(|s| {
-            rva.checked_sub(s.rva).is_some_and(|d| d < s.virtual_size.max(s.file_size))
+            rva.checked_sub(s.rva)
+                .is_some_and(|d| d < s.virtual_size.max(s.file_size))
         })
     }
 
     pub fn is_exec(&self, rva: u32) -> bool {
-        self.section_of(rva).is_some_and(|s| s.characteristics & SCN_EXEC != 0)
+        self.section_of(rva)
+            .is_some_and(|s| s.characteristics & SCN_EXEC != 0)
     }
 
     /// File-backed bytes at `rva`, up to `len` (clamped to the section's raw data).
@@ -61,19 +66,26 @@ impl<'a> Image<'a> {
     /// The `.pdata` table. On x64 every non-leaf function is listed, which
     /// makes it the best function-start oracle available.
     pub fn functions(&self) -> Result<Vec<Func>> {
-        let Some((rva, size)) = self.dir(dir::EXCEPTION) else { return Ok(vec![]) };
+        let Some((rva, size)) = self.dir(dir::EXCEPTION) else {
+            return Ok(vec![]);
+        };
         let Some(raw) = self.bytes(rva, size as usize) else {
             bail!("exception directory is not file-backed")
         };
         let mut out = Vec::with_capacity(raw.len() / 12);
-        for e in raw.chunks_exact(12) {
+        for e in raw.as_chunks::<12>().0 {
             let w = |i: usize| u32::from_le_bytes(e[i..i + 4].try_into().unwrap());
             let (begin, end, unwind) = (w(0), w(4), w(8));
             if begin == 0 && end == 0 {
                 continue;
             }
             let chained = self.unwind_flags(unwind & !1).is_some_and(|f| f & 4 != 0);
-            out.push(Func { begin, end, unwind, chained });
+            out.push(Func {
+                begin,
+                end,
+                unwind,
+                chained,
+            });
         }
         out.sort_by_key(|f| f.begin);
         Ok(out)
@@ -87,8 +99,12 @@ impl<'a> Image<'a> {
     /// RVAs of every `IMAGE_REL_BASED_DIR64` relocation slot.
     pub fn dir64_relocs(&self) -> Vec<u32> {
         let mut out = vec![];
-        let Some((rva, size)) = self.dir(dir::BASERELOC) else { return out };
-        let Some(raw) = self.bytes(rva, size as usize) else { return out };
+        let Some((rva, size)) = self.dir(dir::BASERELOC) else {
+            return out;
+        };
+        let Some(raw) = self.bytes(rva, size as usize) else {
+            return out;
+        };
         let mut p = 0;
         while p + 8 <= raw.len() {
             let page = u32::from_le_bytes(raw[p..p + 4].try_into().unwrap());
@@ -96,7 +112,7 @@ impl<'a> Image<'a> {
             if blk < 8 {
                 break;
             }
-            for e in raw[p + 8..(p + blk).min(raw.len())].chunks_exact(2) {
+            for e in raw[p + 8..(p + blk).min(raw.len())].as_chunks::<2>().0 {
                 let v = u16::from_le_bytes([e[0], e[1]]);
                 if v >> 12 == 10 {
                     out.push(page + (v & 0xfff) as u32);

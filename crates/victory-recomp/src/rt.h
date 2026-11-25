@@ -85,8 +85,17 @@ static inline void fl_set_ucomi(Fl *f, double a, double b) {
 }
 
 /* x86 returns the negative "real indefinite" QNaN for invalid operations; ARM returns a positive one. */
-static inline double nanfix_d(double r, double a, double b) { if (r != r && a == a && b == b) { u64 v = 0xFFF8000000000000ull; memcpy(&r, &v, 8); } return r; }
-static inline float nanfix_f(float r, float a, float b) { if (r != r && a == a && b == b) { u32 v = 0xFFC00000u; memcpy(&r, &v, 4); } return r; }
+/* Done on the bit patterns: LLVM treats every NaN as equivalent and would delete a float-typed fix-up. */
+static inline double nanfix_d(double r, double a, double b) {
+  u64 br, ba, bb; memcpy(&br, &r, 8); memcpy(&ba, &a, 8); memcpy(&bb, &b, 8);
+  if ((br << 1) > 0xFFE0000000000000ull && (ba << 1) <= 0xFFE0000000000000ull && (bb << 1) <= 0xFFE0000000000000ull) br = 0xFFF8000000000000ull;
+  memcpy(&r, &br, 8); return r;
+}
+static inline float nanfix_f(float r, float a, float b) {
+  u32 br, ba, bb; memcpy(&br, &r, 4); memcpy(&ba, &a, 4); memcpy(&bb, &b, 4);
+  if ((br << 1) > 0xFF000000u && (ba << 1) <= 0xFF000000u && (bb << 1) <= 0xFF000000u) br = 0xFFC00000u;
+  memcpy(&r, &br, 4); return r;
+}
 
 static inline s64 cvtt64(double v) { return (v != v || v >= 9223372036854775808.0 || v < -9223372036854775808.0) ? INT64_MIN : (s64)v; }
 static inline s32 cvtt32(double v) { return (v != v || v >= 2147483648.0 || v <= -2147483649.0) ? INT32_MIN : (s32)v; }

@@ -19,7 +19,9 @@ pub fn workdir(name: &str) -> PathBuf {
 
 /// Runs a command, panicking with its output on failure.
 pub fn run(cmd: &mut Command) -> String {
-    let out = cmd.output().unwrap_or_else(|e| panic!("spawn {cmd:?}: {e}"));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("spawn {cmd:?}: {e}"));
     assert!(
         out.status.success(),
         "{cmd:?} failed ({}):\n{}{}",
@@ -32,7 +34,10 @@ pub fn run(cmd: &mut Command) -> String {
 
 /// True when the toolchain pieces the tests need are present (Rosetta, clang).
 pub fn have_tools() -> bool {
-    Command::new("arch").args(["-x86_64", "/usr/bin/true"]).status().is_ok_and(|s| s.success())
+    Command::new("arch")
+        .args(["-x86_64", "/usr/bin/true"])
+        .status()
+        .is_ok_and(|s| s.success())
         && Command::new("clang").arg("--version").output().is_ok()
 }
 
@@ -46,16 +51,33 @@ pub fn write_runtime(dir: &Path) {
 pub fn run_both(dir: &Path, driver: &str, unit: &str, args: &[&str]) -> (String, String) {
     write_runtime(dir);
     let (drv, unit_c) = (dir.join(driver), dir.join(unit));
-    run(Command::new("clang").args(["-arch", "x86_64", "-O1", "-I"]).arg(dir).arg(&drv).arg("-o").arg(dir.join("drv_x86")));
     run(Command::new("clang")
-        .args(["-arch", "arm64", "-O2", "-ffp-contract=off", "-Wno-unused", "-DLIFTED", "-I"])
+        .args(["-arch", "x86_64", "-O1", "-I"])
+        .arg(dir)
+        .arg(&drv)
+        .arg("-o")
+        .arg(dir.join("drv_x86")));
+    run(Command::new("clang")
+        .args([
+            "-arch",
+            "arm64",
+            "-O2",
+            "-ffp-contract=off",
+            "-Wno-unused",
+            "-DLIFTED",
+            "-I",
+        ])
         .arg(dir)
         .arg(&drv)
         .arg(&unit_c)
         .arg(dir.join("rt_host.c"))
         .arg("-o")
         .arg(dir.join("drv_arm")));
-    let x86 = run(Command::new(dir.join("drv_x86")).args(args).current_dir(dir));
-    let arm = run(Command::new(dir.join("drv_arm")).args(args).current_dir(dir));
+    let x86 = run(Command::new(dir.join("drv_x86"))
+        .args(args)
+        .current_dir(dir));
+    let arm = run(Command::new(dir.join("drv_arm"))
+        .args(args)
+        .current_dir(dir));
     (x86, arm)
 }

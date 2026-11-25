@@ -20,13 +20,21 @@ fn tables_for(img: &Image, f: &Func, ins: &[iced_x86::Instruction]) -> Tables {
     let base = img.info.image_base;
     analyze::find_jump_tables(img, f, ins)
         .iter()
-        .map(|t| (base + t.jmp_rva as u64, t.targets.iter().map(|&r| base + r as u64).collect()))
+        .map(|t| {
+            (
+                base + t.jmp_rva as u64,
+                t.targets.iter().map(|&r| base + r as u64).collect(),
+            )
+        })
         .collect()
 }
 
 /// Lifts every non-chained `.pdata` function of `img` into one C unit.
 pub fn lift_image(img: &Image) -> Result<lift::Unit> {
-    let funcs: Vec<Func> = discover::discover(img)?.into_iter().filter(|f| !f.chained).collect();
+    let funcs: Vec<Func> = discover::discover(img)?
+        .into_iter()
+        .filter(|f| !f.chained)
+        .collect();
     let base = img.info.image_base;
     let starts: HashSet<u64> = funcs.iter().map(|f| base + f.begin as u64).collect();
     let decoded: Vec<_> = funcs
@@ -47,7 +55,13 @@ pub fn lift_image(img: &Image) -> Result<lift::Unit> {
         })
         .collect();
     let is_func = |va: u64| starts.contains(&va);
-    Ok(lift::lift_unit(&lift::Ctx { image_base: base, is_func: &is_func }, &fins))
+    Ok(lift::lift_unit(
+        &lift::Ctx {
+            image_base: base,
+            is_func: &is_func,
+        },
+        &fins,
+    ))
 }
 
 /// How much of an image the current lifter handles, by first blocking reason.
@@ -60,11 +74,17 @@ pub struct Coverage {
 }
 
 pub fn coverage(img: &Image) -> Result<Coverage> {
-    let funcs: Vec<Func> = discover::discover(img)?.into_iter().filter(|f| !f.chained).collect();
+    let funcs: Vec<Func> = discover::discover(img)?
+        .into_iter()
+        .filter(|f| !f.chained)
+        .collect();
     let base = img.info.image_base;
     let starts: HashSet<u64> = funcs.iter().map(|f| base + f.begin as u64).collect();
     let is_func = |va: u64| starts.contains(&va);
-    let ctx = lift::Ctx { image_base: base, is_func: &is_func };
+    let ctx = lift::Ctx {
+        image_base: base,
+        is_func: &is_func,
+    };
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let chunk = funcs.len().div_ceil(threads).max(1);
     let mut cov = Coverage::default();
@@ -79,7 +99,12 @@ pub fn coverage(img: &Image) -> Result<Coverage> {
                         let (ins, bad) = analyze::decode_function(img, f);
                         c.total += 1;
                         let tables = tables_for(img, f, &ins);
-                        let fi = lift::FuncIn { begin_va: base + f.begin as u64, end_va: base + f.end as u64, ins: &ins, tables };
+                        let fi = lift::FuncIn {
+                            begin_va: base + f.begin as u64,
+                            end_va: base + f.end as u64,
+                            ins: &ins,
+                            tables,
+                        };
                         match lift::lift_function(ctx, &fi) {
                             Ok(_) if !bad => {
                                 c.lifted += 1;

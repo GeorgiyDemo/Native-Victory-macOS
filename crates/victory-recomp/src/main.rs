@@ -12,7 +12,12 @@ fn main() -> Result<()> {
         "analyze" => print!("{}", analyze::analyze(&img)?.render()),
         "coverage" => {
             let c = coverage(&img)?;
-            println!("functions {}  fully lifted {} ({:.1}%)", c.total, c.lifted, c.lifted as f64 * 100.0 / c.total.max(1) as f64);
+            println!(
+                "functions {}  fully lifted {} ({:.1}%)",
+                c.total,
+                c.lifted,
+                c.lifted as f64 * 100.0 / c.total.max(1) as f64
+            );
             let mut b: Vec<_> = c.blockers.iter().collect();
             b.sort_by(|a, b| b.1.cmp(a.1));
             println!("first blocker per unlifted function (top 40):");
@@ -24,7 +29,11 @@ fn main() -> Result<()> {
             let out = args.get(3).context(USAGE)?;
             let u = lift_image(&img)?;
             std::fs::write(out, &u.c)?;
-            eprintln!("lifted {} functions, {} stubbed", u.lifted.len(), u.failed.len());
+            eprintln!(
+                "lifted {} functions, {} stubbed",
+                u.lifted.len(),
+                u.failed.len()
+            );
             for (va, e) in &u.failed {
                 eprintln!("  stub {:#x}: {e}", va - img.info.image_base);
             }
