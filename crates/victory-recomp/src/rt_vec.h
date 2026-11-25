@@ -304,8 +304,19 @@ static inline double nan3d(double r, double a, double b, double c) {
   if ((br << 1) > 0xFFE0000000000000ull && (ba << 1) <= 0xFFE0000000000000ull && (bb << 1) <= 0xFFE0000000000000ull && (bc << 1) <= 0xFFE0000000000000ull) br = 0xFFF8000000000000ull;
   memcpy(&r, &br, 8); return r;
 }
-static inline float fma1f(float a, float b, float c, int ng, int sc) { return nan3f(fmaf(ng ? -a : a, b, sc ? -c : c), a, b, c); }
-static inline double fma1d(double a, double b, double c, int ng, int sc) { return nan3d(fma(ng ? -a : a, b, sc ? -c : c), a, b, c); }
+/* A NaN operand passes through unchanged (negation applies only to the arithmetic). */
+static inline float fma1f(float a, float b, float c, int ng, int sc) {
+  if (a != a) return a;
+  if (b != b) return b;
+  if (c != c) return c;
+  return nan3f(fmaf(ng ? -a : a, b, sc ? -c : c), a, b, c);
+}
+static inline double fma1d(double a, double b, double c, int ng, int sc) {
+  if (a != a) return a;
+  if (b != b) return b;
+  if (c != c) return c;
+  return nan3d(fma(ng ? -a : a, b, sc ? -c : c), a, b, c);
+}
 static inline X128 h_fma_ps(X128 a, X128 b, X128 c, int ng, int sc) { X128 r; LP(4) r.f[k] = fma1f(a.f[k], b.f[k], c.f[k], ng, sc); return r; }
 static inline X128 h_fma_pd(X128 a, X128 b, X128 c, int ng, int sc) { X128 r; LP(2) r.g[k] = fma1d(a.g[k], b.g[k], c.g[k], ng, sc); return r; }
 /* Scalar: lane 0 from the operation, the rest from `d` (the destination register). */
