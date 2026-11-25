@@ -1,0 +1,19 @@
+[package]
+name = "victory-recomp"
+description = "Static x86-64 to ARM64 recompiler: code discovery, analysis and a C-emitting lifter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+victory-pe.workspace = true
+iced-x86.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+iced-x86 = { workspace = true, features = ["code_asm"] }
+
+[lints]
+workspace = true

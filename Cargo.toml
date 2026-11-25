@@ -22,6 +22,7 @@ victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
+victory-recomp = { path = "crates/victory-recomp" }
 
 # External crates
 anyhow = "1.0.104"
@@ -32,6 +33,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.2"
 object = { version = "0.41.0", default-features = false, features = ["read_core", "pe", "coff", "archive", "std"] }
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
 windows-sys = "0.61.2"
 windows = "0.62.2"
 windows-core = "0.62.2"
