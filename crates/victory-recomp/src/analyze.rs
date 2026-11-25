@@ -58,7 +58,11 @@ fn is_cmov_free_load(code: Code) -> bool {
 /// `movsxd r,[base+idx*4]`) and MSVC (`lea base,[__ImageBase]` then
 /// `mov r32,[base+idx*4+table_rva]`), each followed by `add r,base; jmp r`.
 pub fn find_jump_tables(img: &Image, f: &Func, ins: &[Instruction]) -> Vec<JumpTable> {
-    let base = img.info.image_base;
+    find_jump_tables_with(img.info.image_base, &|rva| img.read_u32(rva), f, ins)
+}
+
+/// Same, over any RVA-addressed `u32` reader (used by tests on raw blobs).
+pub fn find_jump_tables_with(base: u64, read_u32: &dyn Fn(u32) -> Option<u32>, f: &Func, ins: &[Instruction]) -> Vec<JumpTable> {
     let mut out = vec![];
     for (n, j) in ins.iter().enumerate() {
         if j.code() != Code::Jmp_rm64 || j.op0_kind() != OpKind::Register {
@@ -91,7 +95,7 @@ pub fn find_jump_tables(img: &Image, f: &Func, ins: &[Instruction]) -> Vec<JumpT
             .filter(|b| (1..=65536).contains(b));
         let mut targets = vec![];
         for k in 0..bound.unwrap_or(4096) {
-            let Some(e) = img.read_u32(table_rva + 4 * k as u32) else { break };
+            let Some(e) = read_u32(table_rva + 4 * k as u32) else { break };
             let t = if ld.code() == Code::Mov_r32_rm32 || ld.code() == Code::Mov_r64_rm64 {
                 lea_rva.wrapping_add(e)
             } else {
