@@ -71,6 +71,8 @@ pub struct Coverage {
     pub lifted: u64,
     pub instructions_in_lifted: u64,
     pub blockers: BTreeMap<String, u64>,
+    /// Every unsupported instruction reason: (instructions, functions containing it).
+    pub unsupported: BTreeMap<String, (u64, u64)>,
 }
 
 pub fn coverage(img: &Image) -> Result<Coverage> {
@@ -112,6 +114,15 @@ pub fn coverage(img: &Image) -> Result<Coverage> {
                             }
                             Ok(_) => *c.blockers.entry("decode failure".into()).or_default() += 1,
                             Err(e) => {
+                                let mut seen = HashSet::new();
+                                for u in lift::unsupported(ctx, &fi) {
+                                    let r = u.split_once(": ").map_or(u.as_str(), |x| x.1);
+                                    let e = c.unsupported.entry(r.to_string()).or_default();
+                                    e.0 += 1;
+                                    if seen.insert(r.to_string()) {
+                                        e.1 += 1;
+                                    }
+                                }
                                 // "<rva>: <reason>"; bucket by reason.
                                 let r = e.split_once(": ").map_or(e.as_str(), |x| x.1);
                                 *c.blockers.entry(r.to_string()).or_default() += 1;
@@ -129,6 +140,11 @@ pub fn coverage(img: &Image) -> Result<Coverage> {
             cov.instructions_in_lifted += c.instructions_in_lifted;
             for (k, v) in c.blockers {
                 *cov.blockers.entry(k).or_default() += v;
+            }
+            for (k, v) in c.unsupported {
+                let e = cov.unsupported.entry(k).or_default();
+                e.0 += v.0;
+                e.1 += v.1;
             }
         }
     });

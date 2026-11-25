@@ -3,6 +3,10 @@
 #![cfg(target_os = "macos")]
 #![allow(dead_code)]
 
+#[macro_use]
+pub mod difftest;
+pub use difftest::*;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

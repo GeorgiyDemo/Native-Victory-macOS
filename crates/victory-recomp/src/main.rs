@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use victory_recomp::{analyze, coverage, image::Image, lift_image};
 
-const USAGE: &str = "usage: victory-recomp analyze <pe> | coverage <pe> | lift <pe> <out.c> | flatten <pe> <out.bin> | exports <pe>";
+const USAGE: &str = "usage: victory-recomp analyze <pe> | coverage <pe> | unsupported <pe> | lift <pe> <out.c> | flatten <pe> <out.bin> | exports <pe>";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -23,6 +23,16 @@ fn main() -> Result<()> {
             println!("first blocker per unlifted function (top 40):");
             for (k, v) in b.iter().take(40) {
                 println!("  {v:>8}  {k}");
+            }
+        }
+        "unsupported" => {
+            // Every unsupported instruction (not only the first per function), by functions blocked.
+            let c = coverage(&img)?;
+            let mut b: Vec<_> = c.unsupported.iter().collect();
+            b.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+            println!("unsupported reason: functions containing it, instructions (top 150)");
+            for (k, v) in b.iter().take(150) {
+                println!("  {:>8} {:>9}  {k}", v.1, v.0);
             }
         }
         "lift" => {

@@ -7,7 +7,9 @@ use std::fmt::Write as _;
 
 use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 
-pub const RT_HEADER: &str = include_str!("rt.h");
+pub const RT_HEADER: &str = concat!(include_str!("rt.h"), include_str!("rt_vec.h"));
+
+mod vex;
 
 pub struct FuncIn<'a> {
     pub begin_va: u64,
@@ -83,6 +85,8 @@ struct L<'a> {
     ctx: &'a Ctx<'a>,
     f: &'a FuncIn<'a>,
     o: String,
+    /// The function touches vector registers, so ymm upper halves travel with it.
+    y: bool,
 }
 
 type R<T> = Result<T, String>;
@@ -106,6 +110,13 @@ fn mask(bits: u32) -> String {
 }
 
 impl L<'_> {
+    fn sp(&self) -> &'static str {
+        if self.y { "SPILLY()" } else { "SPILL()" }
+    }
+    fn rl(&self) -> &'static str {
+        if self.y { "RELOADY()" } else { "RELOAD()" }
+    }
+
     fn emit(&mut self, s: &str) {
         self.o.push_str(s);
         self.o.push('\n');
@@ -261,11 +272,12 @@ impl L<'_> {
             format!("goto L_{t:x};")
         } else if (self.ctx.is_func)(t) {
             format!(
-                "{{ SPILL(); {}(c); return; }}",
+                "{{ {}; {}(c); return; }}",
+                self.sp(),
                 name(t, self.ctx.image_base)
             )
         } else {
-            format!("{{ SPILL(); rt_dispatch(c, (u64)H({t:#x}ull)); return; }}")
+            format!("{{ {}; rt_dispatch(c, (u64)H({t:#x}ull)); return; }}", self.sp())
         }
     }
 
@@ -280,12 +292,14 @@ impl L<'_> {
                 } else {
                     format!("rt_dispatch(c, (u64)H({t:#x}ull));")
                 };
-                self.emit(&format!("{{ {push} SPILL(); {callee} RELOAD(); }}"));
+                self.emit(&format!("{{ {push} {}; {callee} {}; }}", self.sp(), self.rl()));
             }
             _ => {
                 let t = self.rd(i, 0, 64)?;
                 self.emit(&format!(
-                    "{{ u64 t = {t}; {push} SPILL(); rt_dispatch(c, t); RELOAD(); }}"
+                    "{{ u64 t = {t}; {push} {}; rt_dispatch(c, t); {}; }}",
+                    self.sp(),
+                    self.rl()
                 ));
             }
         }
@@ -593,11 +607,12 @@ impl L<'_> {
             return Err("lock/rep prefix".into());
         }
         let m = i.mnemonic();
-        if self.sse(i)? {
+        if self.sse(i)? || self.vex(i)? {
             return Ok(());
         }
         match m {
             M::Nop | M::Pause => {}
+            M::Mfence | M::Sfence | M::Lfence => self.emit("__atomic_thread_fence(__ATOMIC_SEQ_CST);"),
             M::Int3 | M::Ud2 => self.emit("rt_trap(\"int3/ud2\");"),
             M::Mov => {
                 let bits = Self::bits0(i)?;
@@ -805,7 +820,7 @@ impl L<'_> {
             M::Call => self.call(i)?,
             M::Ret => {
                 let extra = if i.op_count() == 1 { i.immediate(0) } else { 0 };
-                self.emit(&format!("r4 += {}; SPILL(); return;", 8 + extra));
+                self.emit(&format!("r4 += {}; {}; return;", 8 + extra, self.sp()));
             }
             M::Jmp => match i.op0_kind() {
                 OpKind::NearBranch64 => {
@@ -827,7 +842,8 @@ impl L<'_> {
                 _ => {
                     let t = self.rd(i, 0, 64)?;
                     self.emit(&format!(
-                        "{{ u64 t = {t}; SPILL(); rt_dispatch(c, t); return; }}"
+                        "{{ u64 t = {t}; {}; rt_dispatch(c, t); return; }}",
+                        self.sp()
                     ));
                 }
             },
@@ -842,7 +858,31 @@ impl L<'_> {
     }
 }
 
+/// VEX instruction that names an xmm/ymm register, or vzeroupper/vzeroall.
+fn uses_vector(i: &Instruction) -> bool {
+    use iced_x86::EncodingKind;
+    i.code().encoding() == EncodingKind::VEX
+        && (matches!(i.mnemonic(), Mnemonic::Vzeroupper | Mnemonic::Vzeroall)
+            || (0..i.op_count()).any(|n| {
+                i.op_kind(n) == OpKind::Register
+                    && (i.op_register(n).is_xmm() || i.op_register(n).is_ymm())
+            }))
+}
+
 pub fn lift_function(ctx: &Ctx, f: &FuncIn) -> Result<String, String> {
+    let (o, errs) = lift_core(ctx, f, false);
+    match errs.into_iter().next() {
+        Some(e) => Err(e),
+        None => Ok(o),
+    }
+}
+
+/// Every unsupported-instruction error in `f` (not just the first), for ranking what to lift next.
+pub fn unsupported(ctx: &Ctx, f: &FuncIn) -> Vec<String> {
+    lift_core(ctx, f, true).1
+}
+
+fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     // Leaders: branch targets inside the function and jump-table targets.
     let mut labels = BTreeSet::new();
     for i in f.ins {
@@ -858,24 +898,32 @@ pub fn lift_function(ctx: &Ctx, f: &FuncIn) -> Result<String, String> {
     for t in f.tables.values().flatten() {
         labels.insert(*t);
     }
+    let y = f.ins.iter().any(uses_vector);
     let mut l = L {
         ctx,
         f,
         o: String::new(),
+        y,
     };
+    let mut errs = vec![];
     let _ = writeln!(
         l.o,
-        "void {}(Cpu *c) {{ FUNC_PROLOGUE();",
-        name(f.begin_va, ctx.image_base)
+        "void {}(Cpu *c) {{ {};",
+        name(f.begin_va, ctx.image_base),
+        if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" }
     );
     for i in f.ins {
         if labels.contains(&i.ip()) {
             let _ = writeln!(l.o, "L_{:x}:;", i.ip());
         }
-        l.insn(i, &labels)
-            .map_err(|e| format!("{:#x}: {e}", i.ip() - ctx.image_base))?;
+        if let Err(e) = l.insn(i, &labels) {
+            errs.push(format!("{:#x}: {e}", i.ip() - ctx.image_base));
+            if !all {
+                break;
+            }
+        }
     }
     // Falling off the end of a function is only legal after a non-returning call.
     l.o.push_str("rt_trap(\"fell off end of function\"); }\n");
-    Ok(l.o)
+    (l.o, errs)
 }

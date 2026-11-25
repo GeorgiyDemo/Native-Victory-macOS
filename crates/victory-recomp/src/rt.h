@@ -8,14 +8,15 @@
 #include <math.h>
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef int8_t s8; typedef int16_t s16; typedef int32_t s32; typedef int64_t s64;
-typedef union { u8 b[16]; u16 w[8]; u32 d[4]; u64 q[2]; float f[4]; double g[2]; } X128;
+typedef union { u8 b[16]; u16 w[8]; u32 d[4]; u64 q[2]; float f[4]; double g[2]; s8 sb[16]; s16 sw[8]; s32 sd[4]; s64 sq[2]; } X128;
 
 /* Lazy EFLAGS. FK_RAW holds explicit bits in `c`: CF=1 ZF=2 SF=4 OF=8 PF=16. */
 enum { FK_RAW, FK_ADD, FK_ADC, FK_SUB, FK_SBB, FK_LOGIC, FK_INC, FK_DEC };
 typedef struct { u8 k, sz; u64 a, b, r, c; } Fl;
 
 /* Architectural state shared across lifted function boundaries. */
-typedef struct { u64 r[16]; X128 x[16]; } Cpu;
+/* x = low 128 bits of ymm0..15, xh = high 128 bits. Win64 treats the upper halves as volatile, but vectorcall can pass ymm. */
+typedef struct { u64 r[16]; X128 x[16]; X128 xh[16]; } Cpu;
 
 extern u8 *IMG;      /* host address of RVA 0 */
 extern u8 *rt_gs;    /* GS base: TEB (or the per-thread block the host chooses) */
@@ -108,6 +109,16 @@ static inline s32 cvtt32(double v) { return (v != v || v >= 2147483648.0 || v <=
   r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15]; \
   x0=c->x[0];x1=c->x[1];x2=c->x[2];x3=c->x[3];x4=c->x[4];x5=c->x[5];x6=c->x[6];x7=c->x[7]; \
   x8=c->x[8];x9=c->x[9];x10=c->x[10];x11=c->x[11];x12=c->x[12];x13=c->x[13];x14=c->x[14];x15=c->x[15]; } while (0)
+/* Functions that touch ymm/VEX carry the upper halves too. */
+#define SPILLY() do { SPILL(); \
+  c->xh[0]=xh0;c->xh[1]=xh1;c->xh[2]=xh2;c->xh[3]=xh3;c->xh[4]=xh4;c->xh[5]=xh5;c->xh[6]=xh6;c->xh[7]=xh7; \
+  c->xh[8]=xh8;c->xh[9]=xh9;c->xh[10]=xh10;c->xh[11]=xh11;c->xh[12]=xh12;c->xh[13]=xh13;c->xh[14]=xh14;c->xh[15]=xh15; } while (0)
+#define RELOADY() do { RELOAD(); \
+  xh0=c->xh[0];xh1=c->xh[1];xh2=c->xh[2];xh3=c->xh[3];xh4=c->xh[4];xh5=c->xh[5];xh6=c->xh[6];xh7=c->xh[7]; \
+  xh8=c->xh[8];xh9=c->xh[9];xh10=c->xh[10];xh11=c->xh[11];xh12=c->xh[12];xh13=c->xh[13];xh14=c->xh[14];xh15=c->xh[15]; } while (0)
+#define FUNC_PROLOGUE_Y() FUNC_PROLOGUE(); \
+  X128 xh0=c->xh[0],xh1=c->xh[1],xh2=c->xh[2],xh3=c->xh[3],xh4=c->xh[4],xh5=c->xh[5],xh6=c->xh[6],xh7=c->xh[7], \
+       xh8=c->xh[8],xh9=c->xh[9],xh10=c->xh[10],xh11=c->xh[11],xh12=c->xh[12],xh13=c->xh[13],xh14=c->xh[14],xh15=c->xh[15]
 #define FUNC_PROLOGUE() \
   u64 r0=c->r[0],r1=c->r[1],r2=c->r[2],r3=c->r[3],r4=c->r[4],r5=c->r[5],r6=c->r[6],r7=c->r[7], \
       r8=c->r[8],r9=c->r[9],r10=c->r[10],r11=c->r[11],r12=c->r[12],r13=c->r[13],r14=c->r[14],r15=c->r[15]; \
