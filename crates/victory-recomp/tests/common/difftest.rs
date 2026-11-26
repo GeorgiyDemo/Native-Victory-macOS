@@ -290,7 +290,11 @@ pub fn run_arm_only(label: &str, cases: Vec<Case>) -> Vec<Line> {
 }
 
 /// Assembles and lifts `cases` into `target/tmp/<label>`; returns the directory and snippet spans.
-fn prepare(label: &str, cases: &[Case], tables: usize) -> (std::path::PathBuf, Vec<(u32, u32)>) {
+pub fn prepare(
+    label: &str,
+    cases: &[Case],
+    tables: usize,
+) -> (std::path::PathBuf, Vec<(u32, u32)>) {
     let (blob, spans) = assemble(cases);
 
     // Decode, find jump tables, lift.
