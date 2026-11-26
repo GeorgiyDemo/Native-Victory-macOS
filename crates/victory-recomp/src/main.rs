@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use victory_recomp::{analyze, coverage, image::Image, lift_image};
 
-const USAGE: &str = "usage: victory-recomp analyze <pe> | coverage <pe> | unsupported <pe> | lift <pe> <out.c> | flatten <pe> <out.bin> | exports <pe>";
+const USAGE: &str = "usage: victory-recomp analyze <pe> | coverage <pe> | unsupported <pe> | lift <pe> <out.c> | lift-split <pe> <outdir> <funcs-per-unit> | flatten <pe> <out.bin> | exports <pe>";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -38,6 +38,16 @@ fn main() -> Result<()> {
             for (k, v) in b.iter().take(150) {
                 println!("  {:>8} {:>9}  {k}", v.1, v.0);
             }
+        }
+        "lift-split" => {
+            let dir = std::path::PathBuf::from(args.get(3).context(USAGE)?);
+            let per: usize = args.get(4).context(USAGE)?.parse()?;
+            let t = std::time::Instant::now();
+            let (n, ok, stub, units) = victory_recomp::lift_image_split(&img, &dir, per)?;
+            eprintln!(
+                "{n} functions, {ok} lifted, {stub} stubbed, {units} units in {:.1}s",
+                t.elapsed().as_secs_f64()
+            );
         }
         "jmpshapes" => {
             for (k, v) in victory_recomp::unresolved_jmp_shapes(&img)?.iter().take(25) {

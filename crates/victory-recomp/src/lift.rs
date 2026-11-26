@@ -42,6 +42,70 @@ pub struct Unit {
     pub failed: Vec<(u64, String)>,
 }
 
+/// One translation unit of a split build: bodies only, `#include "rt.h"`, declarations just for the
+/// functions it calls. The dispatch table is emitted once by `table_unit`.
+pub fn lift_part(ctx: &Ctx, funcs: &[FuncIn]) -> Unit {
+    let mut u = Unit::default();
+    let mut body = String::new();
+    for f in funcs {
+        match lift_function(ctx, f) {
+            Ok(s) => {
+                body.push_str(&s);
+                u.lifted.push(f.begin_va);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    body,
+                    "void {}(Cpu *c) {{ (void)c; rt_trap(\"unlifted function {:#x}: {}\"); }}",
+                    name(f.begin_va, ctx.image_base),
+                    f.begin_va - ctx.image_base,
+                    e.replace('"', "'")
+                );
+                u.failed.push((f.begin_va, e));
+            }
+        }
+    }
+    let mut called = BTreeSet::new();
+    let b = body.as_bytes();
+    let mut k = 0;
+    while k + 3 < b.len() {
+        if b[k] == b'f' && b[k + 1] == b'_' && (k == 0 || !(b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_')) {
+            let mut e = k + 2;
+            while e < b.len() && b[e].is_ascii_hexdigit() {
+                e += 1;
+            }
+            if e > k + 2 && body[e..].starts_with("(c)") {
+                called.insert(body[k..e].to_string());
+            }
+            k = e;
+        } else {
+            k += 1;
+        }
+    }
+    let _ = writeln!(u.c, "#define IMAGE_BASE {:#x}ull\n#include \"rt.h\"", ctx.image_base);
+    for n in &called {
+        let _ = writeln!(u.c, "void {n}(Cpu *c);");
+    }
+    u.c.push_str(&body);
+    u
+}
+
+/// The dispatch table for a split build: every function declared, sorted by RVA.
+pub fn table_unit(image_base: u64, starts: &[u64]) -> String {
+    let mut c = format!("#define IMAGE_BASE {image_base:#x}ull\n#include \"rt.h\"\n");
+    let mut sorted = starts.to_vec();
+    sorted.sort_unstable();
+    for va in &sorted {
+        let _ = writeln!(c, "void {}(Cpu *c);", name(*va, image_base));
+    }
+    let _ = writeln!(c, "const RtEntry rt_table[] = {{");
+    for va in &sorted {
+        let _ = writeln!(c, "  {{ {:#x}, {} }},", va - image_base, name(*va, image_base));
+    }
+    let _ = writeln!(c, "}};\nconst unsigned rt_table_n = {};", sorted.len());
+    c
+}
+
 fn name(va: u64, base: u64) -> String {
     format!("f_{:x}", va - base)
 }

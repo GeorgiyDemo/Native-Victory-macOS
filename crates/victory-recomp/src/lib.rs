@@ -108,6 +108,74 @@ pub fn lift_image(img: &Image) -> Result<lift::Unit> {
     ))
 }
 
+/// Writes the whole image as `tu_*.c` files of `per_unit` functions, plus `table.c`, `rt.h` and
+/// `rt_host.c`, into `dir`. Returns (functions, lifted, stubbed, units).
+pub fn lift_image_split(
+    img: &Image,
+    dir: &std::path::Path,
+    per_unit: usize,
+) -> Result<(usize, usize, usize, usize)> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let funcs = group_chained(img, discover::discover(img)?);
+    let base = img.info.image_base;
+    let starts: HashSet<u64> = funcs.iter().map(|(f, _)| base + f.begin as u64).collect();
+    let is_func = |va: u64| starts.contains(&va);
+    let ctx = lift::Ctx {
+        image_base: base,
+        is_func: &is_func,
+    };
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("rt.h"), lift::RT_HEADER)?;
+    std::fs::write(dir.join("rt_host.c"), RT_HOST_C)?;
+    let mut all: Vec<u64> = starts.iter().copied().collect();
+    all.sort_unstable();
+    std::fs::write(dir.join("table.c"), lift::table_unit(base, &all))?;
+    let chunks: Vec<&[(Func, Vec<Func>)]> = funcs.chunks(per_unit).collect();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let (next, lifted, stubbed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    std::thread::scope(|sc| -> Result<()> {
+        let hs: Vec<_> = (0..threads)
+            .map(|_| {
+                sc.spawn(|| -> Result<()> {
+                    loop {
+                        let n = next.fetch_add(1, Relaxed);
+                        let Some(part) = chunks.get(n) else {
+                            return Ok(());
+                        };
+                        let decoded: Vec<_> = part
+                            .iter()
+                            .map(|(f, parts)| {
+                                let (ins, _) = decode_group(img, f, parts);
+                                let tables = tables_for(img, f, &ins);
+                                (f, parts, ins, tables)
+                            })
+                            .collect();
+                        let fins: Vec<lift::FuncIn> = decoded
+                            .iter()
+                            .map(|(f, parts, ins, tables)| lift::FuncIn {
+                                begin_va: base + f.begin as u64,
+                                end_va: base + f.end as u64,
+                                ins,
+                                tables: tables.clone(),
+                                extra: extra_ranges(img, parts),
+                            })
+                            .collect();
+                        let u = lift::lift_part(&ctx, &fins);
+                        lifted.fetch_add(u.lifted.len(), Relaxed);
+                        stubbed.fetch_add(u.failed.len(), Relaxed);
+                        std::fs::write(dir.join(format!("tu_{n:05}.c")), u.c)?;
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().map_err(|_| anyhow::anyhow!("lift thread panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok((funcs.len(), lifted.into_inner(), stubbed.into_inner(), chunks.len()))
+}
+
 /// How much of an image the current lifter handles, by first blocking reason.
 #[derive(Default)]
 pub struct Coverage {
