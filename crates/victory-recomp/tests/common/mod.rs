@@ -5,6 +5,7 @@
 
 #[macro_use]
 pub mod difftest;
+#[allow(unused_imports)]
 pub use difftest::*;
 
 use std::path::{Path, PathBuf};

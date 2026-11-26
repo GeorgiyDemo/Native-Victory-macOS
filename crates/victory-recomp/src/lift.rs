@@ -18,6 +18,15 @@ pub struct FuncIn<'a> {
     pub ins: &'a [Instruction],
     /// Jump-table dispatches: `jmp reg` address -> target addresses (all VAs).
     pub tables: BTreeMap<u64, Vec<u64>>,
+    /// Chained `.pdata` parts (cold blocks, funclets) merged into this function: `[begin, end)` VAs.
+    /// Their instructions follow the parent's in `ins`, so a jump into them is a `goto`.
+    pub extra: Vec<(u64, u64)>,
+}
+
+impl FuncIn<'_> {
+    pub fn contains(&self, va: u64) -> bool {
+        (va >= self.begin_va && va < self.end_va) || self.extra.iter().any(|&(b, e)| va >= b && va < e)
+    }
 }
 
 pub struct Ctx<'a> {
@@ -269,7 +278,7 @@ impl L<'_> {
 
     /// Statement that transfers control to guest address `t`.
     fn jump_to(&self, t: u64, labels: &BTreeSet<u64>) -> String {
-        if t >= self.f.begin_va && t < self.f.end_va && labels.contains(&t) {
+        if self.f.contains(t) && labels.contains(&t) {
             format!("goto L_{t:x};")
         } else if (self.ctx.is_func)(t) {
             format!(
@@ -829,10 +838,13 @@ impl L<'_> {
                     self.emit(&s);
                 }
                 OpKind::Register => {
-                    let Some(ts) = self.f.tables.get(&i.ip()) else {
-                        return Err("indirect jmp reg without recovered jump table".into());
-                    };
                     let r = self.rd(i, 0, 64)?;
+                    // No recovered table: a tail call through a register (or a switch we could not
+                    // decode); hand it to the dispatcher, which logs it if it is not a function start.
+                    let Some(ts) = self.f.tables.get(&i.ip()) else {
+                        self.emit(&format!("{{ u64 t = {r}; {}; rt_dispatch(c, t); return; }}", self.sp()));
+                        return Ok(());
+                    };
                     let mut sw = format!("switch ({r} - (u64)IMG + IMAGE_BASE) {{ ");
                     for t in ts.iter().collect::<BTreeSet<_>>() {
                         let _ = write!(sw, "case {t:#x}ull: goto L_{t:x}; ");
@@ -913,7 +925,13 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         name(f.begin_va, ctx.image_base),
         if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" }
     );
+    let mut expect = f.begin_va;
     for i in f.ins {
+        if i.ip() != expect {
+            // Start of a merged part: nothing falls into it.
+            l.o.push_str("rt_trap(\"fell into a merged part\");\n");
+        }
+        expect = i.next_ip();
         if labels.contains(&i.ip()) {
             let _ = writeln!(l.o, "L_{:x}:;", i.ip());
         }

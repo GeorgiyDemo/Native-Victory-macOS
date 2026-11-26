@@ -287,6 +287,7 @@ pub fn run_cases(label: &str, cases: Vec<Case>, tables: usize) {
             end_va: BASE + *e as u64,
             ins,
             tables: t.clone(),
+            extra: vec![],
         })
         .collect();
     let unit = lift_unit(

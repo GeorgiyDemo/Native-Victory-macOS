@@ -20,6 +20,10 @@ fn main() -> Result<()> {
             );
             let mut b: Vec<_> = c.blockers.iter().collect();
             b.sort_by(|a, b| b.1.cmp(a.1));
+            println!(
+                "jmp reg with no recovered table (dispatcher tail call): {} sites in {} functions; chained parts merged: {}",
+                c.untabled_jmps, c.funcs_with_untabled_jmp, c.merged_parts
+            );
             println!("first blocker per unlifted function (top 40):");
             for (k, v) in b.iter().take(40) {
                 println!("  {v:>8}  {k}");
@@ -29,10 +33,15 @@ fn main() -> Result<()> {
             // Every unsupported instruction (not only the first per function), by functions blocked.
             let c = coverage(&img)?;
             let mut b: Vec<_> = c.unsupported.iter().collect();
-            b.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+            b.sort_by_key(|a| std::cmp::Reverse(a.1.1));
             println!("unsupported reason: functions containing it, instructions (top 150)");
             for (k, v) in b.iter().take(150) {
                 println!("  {:>8} {:>9}  {k}", v.1, v.0);
+            }
+        }
+        "jmpshapes" => {
+            for (k, v) in victory_recomp::unresolved_jmp_shapes(&img)?.iter().take(25) {
+                println!("{v:>6}  {k}");
             }
         }
         "lift" => {

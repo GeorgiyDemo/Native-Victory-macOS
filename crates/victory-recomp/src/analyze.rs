@@ -73,7 +73,7 @@ pub fn find_jump_tables_with(
         if j.code() != Code::Jmp_rm64 || j.op0_kind() != OpKind::Register {
             continue;
         }
-        let win = &ins[n.saturating_sub(16)..n];
+        let win = &ins[n.saturating_sub(40)..n];
         // The table base register: a rip-relative lea in the window.
         let Some(lea) = win
             .iter()

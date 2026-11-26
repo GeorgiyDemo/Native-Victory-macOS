@@ -29,29 +29,73 @@ fn tables_for(img: &Image, f: &Func, ins: &[iced_x86::Instruction]) -> Tables {
         .collect()
 }
 
+/// Entry-point functions with their chained `.pdata` parts attached (cold blocks and funclets
+/// continue a parent through the unwind info's chain pointer). A part whose parent is unknown is dropped.
+pub fn group_chained(img: &Image, all: Vec<Func>) -> Vec<(Func, Vec<Func>)> {
+    let mut parts: std::collections::HashMap<u32, Vec<Func>> = Default::default();
+    let by_begin: std::collections::HashMap<u32, Func> = all.iter().map(|f| (f.begin, *f)).collect();
+    for f in all.iter().filter(|f| f.chained) {
+        let mut root = *f;
+        for _ in 0..8 {
+            match img.chain_parent(&root).and_then(|p| by_begin.get(&p)) {
+                Some(p) => root = *p,
+                None => break,
+            }
+            if !root.chained {
+                break;
+            }
+        }
+        if !root.chained {
+            parts.entry(root.begin).or_default().push(*f);
+        }
+    }
+    all.into_iter()
+        .filter(|f| !f.chained)
+        .map(|f| {
+            let mut p = parts.remove(&f.begin).unwrap_or_default();
+            p.sort_by_key(|x| x.begin);
+            (f, p)
+        })
+        .collect()
+}
+
+/// Decodes a function and its merged parts into one instruction list (parent first).
+fn decode_group(img: &Image, f: &Func, parts: &[Func]) -> (Vec<iced_x86::Instruction>, bool) {
+    let (mut ins, mut bad) = analyze::decode_function(img, f);
+    for p in parts {
+        let (i2, b2) = analyze::decode_function(img, p);
+        ins.extend(i2);
+        bad |= b2;
+    }
+    (ins, bad)
+}
+
+fn extra_ranges(img: &Image, parts: &[Func]) -> Vec<(u64, u64)> {
+    let base = img.info.image_base;
+    parts.iter().map(|p| (base + p.begin as u64, base + p.end as u64)).collect()
+}
+
 /// Lifts every non-chained `.pdata` function of `img` into one C unit.
 pub fn lift_image(img: &Image) -> Result<lift::Unit> {
-    let funcs: Vec<Func> = discover::discover(img)?
-        .into_iter()
-        .filter(|f| !f.chained)
-        .collect();
+    let funcs = group_chained(img, discover::discover(img)?);
     let base = img.info.image_base;
-    let starts: HashSet<u64> = funcs.iter().map(|f| base + f.begin as u64).collect();
+    let starts: HashSet<u64> = funcs.iter().map(|(f, _)| base + f.begin as u64).collect();
     let decoded: Vec<_> = funcs
         .iter()
-        .map(|f| {
-            let (ins, _) = analyze::decode_function(img, f);
+        .map(|(f, parts)| {
+            let (ins, _) = decode_group(img, f, parts);
             let tables = tables_for(img, f, &ins);
-            (f, ins, tables)
+            (f, parts, ins, tables)
         })
         .collect();
     let fins: Vec<lift::FuncIn> = decoded
         .iter()
-        .map(|(f, ins, tables)| lift::FuncIn {
+        .map(|(f, parts, ins, tables)| lift::FuncIn {
             begin_va: base + f.begin as u64,
             end_va: base + f.end as u64,
             ins,
             tables: tables.clone(),
+            extra: extra_ranges(img, parts),
         })
         .collect();
     let is_func = |va: u64| starts.contains(&va);
@@ -70,18 +114,20 @@ pub struct Coverage {
     pub total: u64,
     pub lifted: u64,
     pub instructions_in_lifted: u64,
+    /// `jmp reg` sites with no recovered table (lifted as dispatcher tail calls) and the functions holding them.
+    pub untabled_jmps: u64,
+    pub funcs_with_untabled_jmp: u64,
+    /// Chained `.pdata` parts merged into their parents.
+    pub merged_parts: u64,
     pub blockers: BTreeMap<String, u64>,
     /// Every unsupported instruction reason: (instructions, functions containing it).
     pub unsupported: BTreeMap<String, (u64, u64)>,
 }
 
 pub fn coverage(img: &Image) -> Result<Coverage> {
-    let funcs: Vec<Func> = discover::discover(img)?
-        .into_iter()
-        .filter(|f| !f.chained)
-        .collect();
+    let funcs = group_chained(img, discover::discover(img)?);
     let base = img.info.image_base;
-    let starts: HashSet<u64> = funcs.iter().map(|f| base + f.begin as u64).collect();
+    let starts: HashSet<u64> = funcs.iter().map(|(f, _)| base + f.begin as u64).collect();
     let is_func = |va: u64| starts.contains(&va);
     let ctx = lift::Ctx {
         image_base: base,
@@ -97,15 +143,27 @@ pub fn coverage(img: &Image) -> Result<Coverage> {
                 let ctx = &ctx;
                 sc.spawn(move || {
                     let mut c = Coverage::default();
-                    for f in part {
-                        let (ins, bad) = analyze::decode_function(img, f);
+                    for (f, parts) in part {
+                        let (ins, bad) = decode_group(img, f, parts);
                         c.total += 1;
                         let tables = tables_for(img, f, &ins);
+                        let untabled = ins
+                            .iter()
+                            .filter(|i| {
+                                i.code() == iced_x86::Code::Jmp_rm64
+                                    && i.op0_kind() == iced_x86::OpKind::Register
+                                    && !tables.contains_key(&i.ip())
+                            })
+                            .count() as u64;
+                        c.untabled_jmps += untabled;
+                        c.funcs_with_untabled_jmp += (untabled > 0) as u64;
+                        c.merged_parts += parts.len() as u64;
                         let fi = lift::FuncIn {
                             begin_va: base + f.begin as u64,
                             end_va: base + f.end as u64,
                             ins: &ins,
                             tables,
+                            extra: extra_ranges(img, parts),
                         };
                         match lift::lift_function(ctx, &fi) {
                             Ok(_) if !bad => {
@@ -138,6 +196,9 @@ pub fn coverage(img: &Image) -> Result<Coverage> {
             cov.total += c.total;
             cov.lifted += c.lifted;
             cov.instructions_in_lifted += c.instructions_in_lifted;
+            cov.untabled_jmps += c.untabled_jmps;
+            cov.funcs_with_untabled_jmp += c.funcs_with_untabled_jmp;
+            cov.merged_parts += c.merged_parts;
             for (k, v) in c.blockers {
                 *cov.blockers.entry(k).or_default() += v;
             }
@@ -149,4 +210,32 @@ pub fn coverage(img: &Image) -> Result<Coverage> {
         }
     });
     Ok(cov)
+}
+
+/// Shapes of the instruction windows before every `jmp reg` that has no recovered table
+/// (mnemonic + first operand kind of the previous 6 instructions), most common first.
+pub fn unresolved_jmp_shapes(img: &Image) -> Result<Vec<(String, u64)>> {
+    use iced_x86::Code;
+    let funcs: Vec<Func> = discover::discover(img)?.into_iter().filter(|f| !f.chained).collect();
+    let mut m: BTreeMap<String, u64> = BTreeMap::new();
+    for f in &funcs {
+        let (ins, _) = analyze::decode_function(img, f);
+        let tables = tables_for(img, f, &ins);
+        for (n, j) in ins.iter().enumerate() {
+            if j.code() != Code::Jmp_rm64 || j.op0_kind() != iced_x86::OpKind::Register {
+                continue;
+            }
+            if tables.contains_key(&j.ip()) {
+                continue;
+            }
+            let sig: Vec<String> = ins[n.saturating_sub(6)..n]
+                .iter()
+                .map(|i| format!("{:?}", i.mnemonic()))
+                .collect();
+            *m.entry(sig.join(" ")).or_default() += 1;
+        }
+    }
+    let mut v: Vec<_> = m.into_iter().collect();
+    v.sort_by_key(|a| std::cmp::Reverse(a.1));
+    Ok(v)
 }

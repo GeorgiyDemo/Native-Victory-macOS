@@ -91,6 +91,19 @@ impl<'a> Image<'a> {
         Ok(out)
     }
 
+    /// The parent `RUNTIME_FUNCTION` a chained entry continues (UNWIND_INFO ends with the parent's
+    /// 12-byte entry when CHAININFO is set); returns the parent's begin RVA.
+    pub fn chain_parent(&self, f: &Func) -> Option<u32> {
+        if !f.chained {
+            return None;
+        }
+        let u = f.unwind & !1;
+        let hdr = self.bytes(u, 4)?;
+        let codes = hdr[2] as u32;
+        let at = u + 4 + ((codes + 1) & !1) * 2;
+        self.read_u32(at)
+    }
+
     /// `UNWIND_INFO.Flags` (EHANDLER=1, UHANDLER=2, CHAININFO=4).
     pub fn unwind_flags(&self, unwind_rva: u32) -> Option<u8> {
         Some(self.bytes(unwind_rva, 1)?[0] >> 3)
