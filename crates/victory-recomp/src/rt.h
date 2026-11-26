@@ -44,7 +44,8 @@ void rt_init(u8 *img, u64 size);
  * address rt_import_bind returned. The host function is called directly: arguments are taken from the Cpu by the
  * Windows x64 rules (rcx rdx r8 r9 / xmm0-3 by position, then the stack after the return address and 32 bytes of
  * shadow space) and passed by the native (AAPCS64) rules, so it can be a plain C or Rust `extern "C"` function.
- * At most 8 integer and 8 floating-point arguments. `raw`, if set, is called with the Cpu instead. */
+ * At most 16 integer and 8 floating-point arguments (those past the eighth integer go on the native stack as
+ * 64-bit slots, so the function must declare them 64-bit). `raw`, if set, is called with the Cpu instead. */
 enum { RT_RET_I64, RT_RET_I32, RT_RET_F64, RT_RET_F32, RT_RET_VOID };
 typedef struct {
   const char *name;

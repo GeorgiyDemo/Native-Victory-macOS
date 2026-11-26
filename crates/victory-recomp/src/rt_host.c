@@ -67,9 +67,9 @@ const char *rt_import_name(u64 t) {
   return t >= (u64)imp_area && t < (u64)(imp_area + sizeof imp_area) ? imps[(t - (u64)imp_area) / 16].name : 0;
 }
 
-typedef u64 (*FnI)(u64, u64, u64, u64, u64, u64, u64, u64, double, double, double, double, double, double, double, double);
-typedef double (*FnD)(u64, u64, u64, u64, u64, u64, u64, u64, double, double, double, double, double, double, double, double);
-typedef float (*FnF)(u64, u64, u64, u64, u64, u64, u64, u64, double, double, double, double, double, double, double, double);
+typedef u64 (*FnI)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, double, double, double, double, double, double, double, double);
+typedef double (*FnD)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, double, double, double, double, double, double, double, double);
+typedef float (*FnF)(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, double, double, double, double, double, double, double, double);
 
 static void import_call(Cpu *c, const RtImport *m) {
   Cpu *saved = rt_cur;
@@ -80,19 +80,19 @@ static void import_call(Cpu *c, const RtImport *m) {
     m->raw(c);
   } else {
     static const u8 reg[4] = { 1, 2, 8, 9 }; /* rcx rdx r8 r9 */
-    u64 ia[8] = {0}; double da[8] = {0};
+    u64 ia[16] = {0}; double da[8] = {0};
     unsigned ni = 0, nf = 0;
     for (unsigned i = 0; i < m->argc; i++) {
       int isf = (m->fmask | m->smask) >> i & 1;
       u64 v = i < 4 ? (isf ? c->x[i].q[0] : c->r[reg[i]]) : ld64((u8 *)(c->r[4] + 8 + 8 * (u64)i));
       if (isf) { if (nf == 8) rt_trap("more than 8 floating-point import arguments"); memcpy(&da[nf++], &v, 8); }
-      else { if (ni == 8) rt_trap("more than 8 integer import arguments"); ia[ni++] = v; }
+      else { if (ni == 16) rt_trap("more than 16 integer import arguments"); ia[ni++] = v; }
     }
     switch (m->ret) {
-    case RT_RET_F64: c->x[0].g[0] = ((FnD)m->fn)(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], ia[6], ia[7], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]); break;
-    case RT_RET_F32: c->x[0].f[0] = ((FnF)m->fn)(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], ia[6], ia[7], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]); break;
+    case RT_RET_F64: c->x[0].g[0] = ((FnD)m->fn)(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], ia[6], ia[7], ia[8], ia[9], ia[10], ia[11], ia[12], ia[13], ia[14], ia[15], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]); break;
+    case RT_RET_F32: c->x[0].f[0] = ((FnF)m->fn)(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], ia[6], ia[7], ia[8], ia[9], ia[10], ia[11], ia[12], ia[13], ia[14], ia[15], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]); break;
     default: {
-      u64 r = ((FnI)m->fn)(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], ia[6], ia[7], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]);
+      u64 r = ((FnI)m->fn)(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], ia[6], ia[7], ia[8], ia[9], ia[10], ia[11], ia[12], ia[13], ia[14], ia[15], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]);
       /* A 32-bit result leaves the upper half of x0 undefined on arm64; Windows code reads eax. */
       c->r[0] = m->ret == RT_RET_I32 ? (u32)r : m->ret == RT_RET_VOID ? c->r[0] : r;
     }
@@ -161,7 +161,8 @@ u64 rt_call_guest(u64 target, const u64 *args, u32 n, u32 fmask, u64 *xmm0) {
   Cpu c; memset(&c, 0, sizeof c);
   c.gs_base = (u64)tl_gs;
   /* Below the innermost running frame (minus a margin for what the host call itself may have used), else the stack top. */
-  u64 top = rt_cur ? rt_cur->r[4] - 0x200 : (u64)tl_hi;
+  /* On the stack's top, a margin: the callee may read stack arguments of an import call past what the caller wrote. */
+  u64 top = rt_cur ? rt_cur->r[4] - 0x200 : (u64)tl_hi - 0x100;
   top &= ~15ull;
   u64 need = (0x28 + 8 * (n > 4 ? n - 4 : 0) + 15) & ~15ull;
   u64 sp = top - need - 8; /* rsp = 8 mod 16 after the (fake) call */

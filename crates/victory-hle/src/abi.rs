@@ -14,9 +14,11 @@
 //! string does the remapping.
 //!
 //! shortcut: only functions that appear in a lookup table (`fn_addr!`) get a signature. Method tables are
-//! static arrays of bare addresses; their slots are called with [`METHOD_SIG`] (eight integers, an integer
-//! result), right for every method without a float argument; the modules that own the few with one say so
-//! (`note_methods`). A method with more than eight integer arguments would lose the rest.
+//! static arrays of bare addresses; their slots are called with [`METHOD_SIG`] (sixteen integers, an integer
+//! result: `this` and the Windows arguments, four in registers and the rest on the stack), right for every
+//! method without a float argument; the modules that own the few with one say so (`note_methods`). A method
+//! with more than eight integer arguments must declare those past the eighth as 64-bit (AAPCS64 on Apple
+//! packs smaller ones into the stack slot); one with more than sixteen is a trap.
 
 #[cfg(target_arch = "aarch64")]
 mod derived {
@@ -76,7 +78,7 @@ pub use derived::{declared, note, record, sig_of};
 /// What a method table's slots are called with when nothing says otherwise: the Windows x64 integer
 /// arguments (four registers, then the stack), an integer result.
 #[cfg(target_arch = "aarch64")]
-pub const METHOD_SIG: &str = "iiiiiiii>i";
+pub const METHOD_SIG: &str = "iiiiiiiiiiiiiiii>i";
 
 /// Elsewhere the address is all there is (x86-64 hosts need no signature).
 #[cfg(not(target_arch = "aarch64"))]
