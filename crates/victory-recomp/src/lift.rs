@@ -161,6 +161,8 @@ struct L<'a> {
     o: String,
     /// The function touches vector registers, so ymm upper halves travel with it.
     y: bool,
+    /// Addresses of this function's instructions: the only valid `goto` targets.
+    ips: std::collections::HashSet<u64>,
 }
 
 type R<T> = Result<T, String>;
@@ -341,8 +343,8 @@ impl L<'_> {
     }
 
     /// Statement that transfers control to guest address `t`.
-    fn jump_to(&self, t: u64, labels: &BTreeSet<u64>) -> String {
-        if self.f.contains(t) && labels.contains(&t) {
+    fn jump_to(&self, t: u64, _labels: &BTreeSet<u64>) -> String {
+        if self.ips.contains(&t) {
             format!("goto L_{t:x};")
         } else if (self.ctx.is_func)(t) {
             format!(
@@ -905,7 +907,7 @@ impl L<'_> {
                     let r = self.rd(i, 0, 64)?;
                     // No recovered table: a tail call through a register (or a switch we could not
                     // decode); hand it to the dispatcher, which logs it if it is not a function start.
-                    let Some(ts) = self.f.tables.get(&i.ip()) else {
+                    let Some(ts) = self.f.tables.get(&i.ip()).filter(|ts| ts.iter().all(|t| self.ips.contains(t))) else {
                         self.emit(&format!("{{ u64 t = {r}; {}; rt_dispatch(c, t); return; }}", self.sp()));
                         return Ok(());
                     };
@@ -972,8 +974,9 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
             labels.insert(i.near_branch_target());
         }
     }
-    for t in f.tables.values().flatten() {
-        labels.insert(*t);
+    let ipset: std::collections::HashSet<u64> = f.ins.iter().map(|i| i.ip()).collect();
+    for ts in f.tables.values().filter(|ts| ts.iter().all(|t| ipset.contains(t))) {
+        labels.extend(ts.iter().copied());
     }
     let y = f.ins.iter().any(uses_vector);
     let mut l = L {
@@ -981,6 +984,7 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         f,
         o: String::new(),
         y,
+        ips: f.ins.iter().map(|i| i.ip()).collect(),
     };
     let mut errs = vec![];
     let _ = writeln!(
