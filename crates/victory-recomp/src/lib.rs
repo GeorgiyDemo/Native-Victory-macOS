@@ -7,6 +7,8 @@ pub mod lift;
 
 /// Files a host needs next to a lifted unit: the runtime header and prototype host.
 pub const RT_HOST_C: &str = include_str!("rt_host.c");
+/// For an image built as a dylib of its own (several images in one process): its `IMG` and unit record.
+pub const RT_UNIT_C: &str = include_str!("rt_unit.c");
 pub const HARNESS_H: &str = include_str!("harness.h");
 
 use std::collections::{BTreeMap, HashSet};
@@ -135,6 +137,7 @@ pub fn lift_image_split(
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("rt.h"), lift::RT_HEADER)?;
     std::fs::write(dir.join("rt_host.c"), RT_HOST_C)?;
+    std::fs::write(dir.join("rt_unit.c"), RT_UNIT_C)?;
     let mut all: Vec<u64> = starts.iter().copied().collect();
     all.sort_unstable();
     std::fs::write(dir.join("table.c"), lift::table_unit(base, &all))?;

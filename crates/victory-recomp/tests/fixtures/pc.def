@@ -1,0 +1,3 @@
+LIBRARY pc.dll
+EXPORTS
+pc_inc

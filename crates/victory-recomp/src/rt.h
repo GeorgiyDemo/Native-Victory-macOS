@@ -286,6 +286,13 @@ static inline s32 cvtt32(double v) { return (v != v || v >= 2147483648.0 || v <=
 typedef struct { u32 rva; RtFn fn; } RtEntry;
 extern const RtEntry rt_table[];
 extern const unsigned rt_table_n;
+/* A lifted image built as a dylib of its own (rt_unit.c, beside the generated tables) hands the runtime this: the
+ * variable that holds its IMG and its dispatch table. rt_image_add registers it for the image mapped at `base`
+ * (size bytes, relocated) and sets its IMG; the runtime then dispatches into every registered image. */
+typedef struct { u8 **img; const RtEntry *tab; const unsigned *n; } RtUnit;
+void rt_image_add(u8 *base, u64 size, const RtUnit *unit);
+/* The base of the registered image whose lifted code contains the host instruction `pc`, or 0. */
+u64 rt_image_of_pc(u64 pc);
 
 /* Calls a lifted function by RVA with the Windows x64 convention (tests, host entry). */
 static inline u64 rt_call_win64(u32 rva, u64 a, u64 b, u64 cc, u64 d, double da, double db, double dc, X128 *xmm0) {

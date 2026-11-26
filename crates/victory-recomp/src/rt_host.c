@@ -9,45 +9,76 @@
 #include <dlfcn.h>
 #include <sys/ucontext.h>
 
-u8 *IMG;
-static u64 img_size;
+#ifndef RT_MULTI
+u8 *IMG; /* one image, compiled into the same dylib as the runtime */
+#endif
 
 void rt_trap(const char *why) { fprintf(stderr, "rt_trap: %s\n", why); abort(); }
 
-/* ---- dispatch ---- */
-static u32 *hash_slot;   /* index + 1 into rt_table, 0 = empty */
-static u32 hash_shift;
+/* ---- dispatch: one table per lifted image ----
+ * A process can hold several images (the exe and the DLLs it ships), each a lifted unit of its own (a dylib that
+ * defines IMG, rt_table and rt_unit; see rt_unit.c) registered by rt_image_add. An address belongs to the image whose
+ * mapped range holds it. Built with -DRT_MULTI the runtime has no unit of its own; without it, a single image
+ * compiled in beside the runtime is registered by rt_init(img, size). */
+typedef struct {
+  u8 *base; u64 size;
+  const RtEntry *tab; unsigned n;
+  u32 *hash;    /* index + 1 into tab, 0 = empty */
+  u32 shift;
+  const void *dylib; /* base of the dylib holding the lifted code, to tell a fault in it from one in the host */
+} RtImg;
+#define MAX_IMAGES 32
+static RtImg images[MAX_IMAGES];
+static unsigned n_images;
 
-static inline u32 hash_of(u32 rva) { return (rva * 0x9E3779B1u) >> hash_shift; }
+static inline u32 hash_of(const RtImg *m, u32 rva) { return (rva * 0x9E3779B1u) >> m->shift; }
 
-void rt_init(u8 *img, u64 size) {
-  IMG = img; img_size = size;
+static unsigned image_add(u8 *base, u64 size, const RtEntry *tab, unsigned n, u8 **slot) {
+  if (n_images == MAX_IMAGES) rt_trap("too many lifted images");
+  RtImg *m = &images[n_images];
+  memset(m, 0, sizeof *m);
+  m->base = base; m->size = size; m->tab = tab; m->n = n;
   u32 bits = 4;
-  while ((1u << bits) < rt_table_n * 2u) bits++;
-  hash_shift = 32 - bits;
-  free(hash_slot);
-  hash_slot = calloc((size_t)1 << bits, sizeof(u32));
-  if (!hash_slot) rt_trap("out of memory building the dispatch hash");
-  for (unsigned i = 0; i < rt_table_n; i++) {
-    u32 h = hash_of(rt_table[i].rva);
-    while (hash_slot[h]) h = (h + 1) & ((1u << bits) - 1);
-    hash_slot[h] = i + 1;
+  while ((1u << bits) < n * 2u) bits++;
+  m->shift = 32 - bits;
+  m->hash = calloc((size_t)1 << bits, sizeof(u32));
+  if (!m->hash) rt_trap("out of memory building the dispatch hash");
+  for (unsigned i = 0; i < n; i++) {
+    u32 h = hash_of(m, tab[i].rva);
+    while (m->hash[h]) h = (h + 1) & ((1u << bits) - 1);
+    m->hash[h] = i + 1;
   }
+  Dl_info di;
+  m->dylib = dladdr(tab, &di) ? di.dli_fbase : 0;
+  if (slot) *slot = base;
+  __atomic_store_n(&n_images, n_images + 1, __ATOMIC_RELEASE); /* published once filled: other threads dispatch meanwhile */
+  return n_images - 1;
 }
 
-static inline RtFn lookup(u32 rva) {
-  if (__builtin_expect(hash_slot != 0, 1)) {
-    u32 mask = (1u << (32 - hash_shift)) - 1;
-    for (u32 h = hash_of(rva); hash_slot[h]; h = (h + 1) & mask)
-      if (rt_table[hash_slot[h] - 1].rva == rva) return rt_table[hash_slot[h] - 1].fn;
-    return 0;
-  }
-  unsigned lo = 0, hi = rt_table_n; /* before rt_init: binary search */
-  while (lo < hi) {
-    unsigned mid = (lo + hi) / 2;
-    if (rt_table[mid].rva < rva) lo = mid + 1; else hi = mid;
-  }
-  return lo < rt_table_n && rt_table[lo].rva == rva ? rt_table[lo].fn : 0;
+void rt_image_add(u8 *base, u64 size, const RtUnit *u) { image_add(base, size, u->tab, *u->n, u->img); }
+
+#ifdef RT_MULTI
+void rt_init(u8 *img, u64 size) { (void)img; (void)size; rt_trap("rt_init: this runtime has no unit of its own (rt_image_add)"); }
+#else
+void rt_init(u8 *img, u64 size) {
+  if (n_images) rt_trap("rt_init: an image is already attached");
+  image_add(img, size, rt_table, rt_table_n, &IMG);
+}
+#endif
+
+static inline RtFn lookup(const RtImg *m, u32 rva) {
+  u32 mask = (1u << (32 - m->shift)) - 1;
+  for (u32 h = hash_of(m, rva); m->hash[h]; h = (h + 1) & mask)
+    if (m->tab[m->hash[h] - 1].rva == rva) return m->tab[m->hash[h] - 1].fn;
+  return 0;
+}
+
+/* The image holding the host instruction `pc`, by the dylib it is in: its base address, or 0. */
+u64 rt_image_of_pc(u64 pc) {
+  Dl_info di;
+  if (!dladdr((void *)pc, &di)) return 0;
+  for (unsigned i = 0; i < n_images; i++) if (images[i].dylib == di.dli_fbase) return (u64)images[i].base;
+  return 0;
 }
 
 /* ---- imports ---- */
@@ -121,20 +152,29 @@ void rt_unresolved(Cpu *c, u64 t) {
   for (unsigned i = 0; i < n_seen; i++) if (seen[i] == t) fresh = 0;
   if (fresh && n_seen < 2048) seen[n_seen++] = t;
   pthread_mutex_unlock(&seen_lock);
-  if (fresh)
+  if (fresh) {
+    const RtImg *in = 0;
+    for (unsigned i = 0; i < n_images; i++) if (t - (u64)images[i].base < images[i].size) in = &images[i];
     fprintf(stderr, "rt: unresolved guest target %#llx (%s, rva %#llx)\n", (unsigned long long)t,
-            t - (u64)IMG < img_size ? "inside the image, not a lifted function start" : "outside the image",
-            (unsigned long long)(t - (u64)IMG));
+            in ? "inside an image, not a lifted function start" : "outside every image",
+            (unsigned long long)(in ? t - (u64)in->base : t));
+  }
   if (!fallback) { fprintf(stderr, "rt: no fallback installed\n"); abort(); }
   fallback(c, t);
 }
 
 void rt_dispatch(Cpu *c, u64 target) {
-  u64 rva = target - (u64)IMG;
-  if (__builtin_expect(rva < img_size, 1)) {
-    RtFn f = lookup((u32)rva);
-    if (__builtin_expect(f != 0, 1)) { f(c); return; }
-  } else if (target - (u64)imp_area < sizeof imp_area) {
+  for (unsigned i = 0, n = __atomic_load_n(&n_images, __ATOMIC_ACQUIRE); i < n; i++) {
+    const RtImg *m = &images[i];
+    u64 rva = target - (u64)m->base;
+    if (__builtin_expect(rva < m->size, 1)) {
+      RtFn f = lookup(m, (u32)rva);
+      if (__builtin_expect(f != 0, 1)) { f(c); return; }
+      rt_unresolved(c, target);
+      return;
+    }
+  }
+  if (target - (u64)imp_area < sizeof imp_area) {
     unsigned i = (unsigned)((target - (u64)imp_area) / 16);
     if (i < n_imps) { import_call(c, &imps[i]); return; }
   }
@@ -257,7 +297,10 @@ void rt_resume(const u64 *gpr, const X128 *xmm, u64 rip) {
 static RtFaultHook fault_hook;
 static __thread RtFault fault_info;
 static struct sigaction old_action[32];
-static const void *own_base;
+static int is_unit_dylib(const void *base) {
+  for (unsigned i = 0; i < n_images; i++) if (images[i].dylib == base) return 1;
+  return 0;
+}
 
 /* Runs on the faulting thread after the signal handler returned into it: the stack is the thread's own, below the
  * fault. The guest's rsp is what the last spill says; frames for callbacks go well below it. */
@@ -276,7 +319,7 @@ static void on_fault(int sig, siginfo_t *si, void *uctx) {
   u64 pc = uc->uc_mcontext->__ss.__pc, sp = uc->uc_mcontext->__ss.__sp;
   Dl_info di;
   /* Ours only if lifted code (this dylib) was running on a guest call. */
-  if (rt_run && fault_hook && dladdr((void *)pc, &di) && di.dli_fbase == own_base) {
+  if (rt_run && fault_hook && dladdr((void *)pc, &di) && is_unit_dylib(di.dli_fbase)) {
     fault_info = (RtFault){ (u32)sig, (u32)si->si_code, (u32)uc->uc_mcontext->__es.__esr, pc, (u64)si->si_addr, rt_run };
     uc->uc_mcontext->__ss.__sp = (sp - 256) & ~15ull; /* below the red zone */
     uc->uc_mcontext->__ss.__pc = (u64)fault_entry;
@@ -287,9 +330,6 @@ static void on_fault(int sig, siginfo_t *si, void *uctx) {
 }
 
 void rt_fault_install(RtFaultHook hook) {
-  Dl_info di;
-  if (!dladdr((void *)rt_fault_install, &di)) rt_trap("dladdr");
-  own_base = di.dli_fbase;
   fault_hook = hook;
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);

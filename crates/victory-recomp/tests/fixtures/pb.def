@@ -1,0 +1,4 @@
+LIBRARY pb.dll
+EXPORTS
+pb_scale
+pb_apply

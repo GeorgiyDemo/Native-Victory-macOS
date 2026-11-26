@@ -254,8 +254,9 @@ pub mod arm64 {
     unsafe extern "C" fn on_fault(f: *const victory_rt::Fault) {
         // SAFETY: the runtime's record, and the Cpu it names.
         let (fault, run) = unsafe { (&*f, &*(*f).run) };
-        let base = victory_rt::image_base();
-        let Some(begin) = lifted_function_at(fault.pc).map(|rva| base + rva as usize) else {
+        let Some((base, begin)) = victory_rt::image_of_pc(fault.pc)
+            .and_then(|base| Some((base, base + lifted_function_at(fault.pc)? as usize)))
+        else {
             eprintln!("VIctory: fault at host {:#x} outside any lifted function", fault.pc);
             std::process::abort();
         };

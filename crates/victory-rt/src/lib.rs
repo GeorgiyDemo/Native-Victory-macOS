@@ -8,14 +8,16 @@
 //! `Cpu` struct and calls an ordinary `extern "C"` Rust function. See `docs/recompiler.md`, "Native arm64 host".
 //!
 //! One host per process: the runtime keeps its state in the dylib's globals, and import functions reach
-//! the callback entry point through [`call_guest`].
+//! the callback entry point through [`call_guest`]. A process can hold several lifted images (the exe and the
+//! DLLs it ships): build the runtime alone with `-DRT_MULTI`, each image as a dylib with `rt_unit.c`, and attach
+//! each with [`attach_unit`]; with one dylib holding the runtime and the lifted code, [`attach_image`] is the call.
 
 use std::alloc::{Layout, alloc_zeroed};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Context, Result, bail};
 use victory_recomp::image::Image;
@@ -117,7 +119,11 @@ struct Rt {
     cur_import: CurImport,
     fault_install: FaultInstall,
     resume: Resume,
+    image_add: ImageAdd,
+    image_of_pc: ImageOfPc,
 }
+type ImageAdd = unsafe extern "C" fn(*mut u8, u64, *const c_void);
+type ImageOfPc = unsafe extern "C" fn(u64) -> u64;
 type FaultInstall = unsafe extern "C" fn(unsafe extern "C" fn(*const Fault));
 type Resume = unsafe extern "C" fn(*const u64, *const [u8; 16], u64) -> !;
 type Init = unsafe extern "C" fn(*mut u8, u64);
@@ -143,22 +149,46 @@ pub fn call_guest(target: u64, args: &[u64], fmask: u32) -> (u64, u64) {
 }
 
 static IMAGE: AtomicUsize = AtomicUsize::new(0);
-static IMAGE_END: AtomicUsize = AtomicUsize::new(0);
+/// Every attached image, `(base, end)`; the first is the main one.
+static RANGES: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+
+fn note_image(base: usize, len: usize) {
+    let mut ranges = RANGES.write().unwrap_or_else(|e| e.into_inner());
+    if ranges.is_empty() {
+        IMAGE.store(base, Ordering::Release);
+    }
+    ranges.push((base, base + len));
+}
 
 /// Whether an image is loaded: until then there is no guest to hand a function or an object to.
 pub fn is_loaded() -> bool {
     IMAGE.load(Ordering::Acquire) != 0
 }
 
-/// Where the loaded image is (0 before one is attached).
+/// Where the first image (the main one) is (0 before one is attached).
 pub fn image_base() -> usize {
     IMAGE.load(Ordering::Acquire)
 }
 
-/// Whether `addr` is inside the loaded guest image: a callback pointer there is lifted code and must be
+/// Whether `addr` is inside an attached guest image: a callback pointer there is lifted code and must be
 /// called through [`call_guest`]; any other address is a function of ours.
 pub fn contains(addr: u64) -> bool {
-    (IMAGE.load(Ordering::Acquire) as u64..IMAGE_END.load(Ordering::Acquire) as u64).contains(&addr)
+    let addr = addr as usize;
+    RANGES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(b, e)| (b..e).contains(&addr))
+}
+
+/// The base of the attached image whose lifted code holds the host instruction `pc`.
+pub fn image_of_pc(pc: u64) -> Option<usize> {
+    let rt = RT.get()?;
+    // SAFETY: plain lookup.
+    match unsafe { (rt.image_of_pc)(pc) } {
+        0 => None,
+        base => Some(base as usize),
+    }
 }
 
 /// The runtime's thunk for a host function: the address lifted code calls (through an IAT slot, or from a
@@ -210,7 +240,8 @@ pub struct Host {
 pub fn open(dylib: &Path) -> Result<()> {
     let path = CString::new(dylib.to_str().context("dylib path")?)?;
     // SAFETY: plain dlopen of a library we just built.
-    let lib = unsafe { dlopen(path.as_ptr(), 2) };
+    // RTLD_NOW | RTLD_GLOBAL: lifted images built as dylibs of their own bind the runtime's symbols from here.
+    let lib = unsafe { dlopen(path.as_ptr(), 2 | 8) };
     if lib.is_null() {
         // SAFETY: dlerror returns a NUL-terminated string after a failed dlopen.
         let e = unsafe { std::ffi::CStr::from_ptr(dlerror()) };
@@ -242,6 +273,8 @@ pub fn open(dylib: &Path) -> Result<()> {
             cur_import: std::mem::transmute::<*mut c_void, CurImport>(sym("rt_current_import")?),
             fault_install: std::mem::transmute::<*mut c_void, FaultInstall>(sym("rt_fault_install")?),
             resume: std::mem::transmute::<*mut c_void, Resume>(sym("rt_resume")?),
+            image_add: std::mem::transmute::<*mut c_void, ImageAdd>(sym("rt_image_add")?),
+            image_of_pc: std::mem::transmute::<*mut c_void, ImageOfPc>(sym("rt_image_of_pc")?),
         }
     };
     if RT.set(rt).is_err() {
@@ -259,8 +292,34 @@ pub unsafe fn attach_image(base: *mut u8, len: usize) -> Result<()> {
     let rt = RT.get().context("no host loaded")?;
     // SAFETY: forwarded.
     unsafe { (rt.init)(base, len as u64) };
-    IMAGE.store(base as usize, Ordering::Release);
-    IMAGE_END.store(base as usize + len, Ordering::Release);
+    note_image(base as usize, len);
+    Ok(())
+}
+
+/// Attaches one more lifted image, built as a dylib of its own (`rt_unit.c`, the runtime built with `-DRT_MULTI`):
+/// loads `unit`, registers its dispatch table for the image mapped at `base`, and from then on a call or a jump to
+/// any of its functions, from any image, finds it. Once per image, in any order; the first is the main image.
+///
+/// # Safety
+/// `base..base+len` is the mapped image the unit was lifted from (relocations applied), and stays mapped.
+pub unsafe fn attach_unit(unit: &Path, base: *mut u8, len: usize) -> Result<()> {
+    let rt = RT.get().context("no host loaded")?;
+    let path = CString::new(unit.to_str().context("unit path")?)?;
+    // SAFETY: plain dlopen of a library we just built; local, so its function names stay its own.
+    let lib = unsafe { dlopen(path.as_ptr(), 2 | 4) };
+    if lib.is_null() {
+        // SAFETY: dlerror returns a NUL-terminated string after a failed dlopen.
+        let e = unsafe { std::ffi::CStr::from_ptr(dlerror()) };
+        bail!("dlopen {}: {}", unit.display(), e.to_string_lossy());
+    }
+    // SAFETY: lib is a live handle.
+    let record = unsafe { dlsym(lib, c"rt_unit".as_ptr()) };
+    if record.is_null() {
+        bail!("rt_unit not found in {} (built without rt_unit.c?)", unit.display());
+    }
+    // SAFETY: `rt_unit` is the RtUnit record of rt_unit.c.
+    unsafe { (rt.image_add)(base, len as u64, record) };
+    note_image(base as usize, len);
     Ok(())
 }
 
