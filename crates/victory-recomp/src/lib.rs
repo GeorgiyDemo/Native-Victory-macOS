@@ -121,6 +121,15 @@ fn unit_name(ext: bool, n_old: &mut usize, n_new: &mut usize) -> String {
     if ext { format!("tu_x{:04}", *n - 1) } else { format!("tu_{:05}", *n - 1) }
 }
 
+/// Writes `data` to `path` unless the file already holds exactly that, so an unchanged unit keeps its modification time
+/// and a build tool (make) skips recompiling it: a lifter fix rebuilds only the units whose generated C changed.
+fn write_if_changed(path: &std::path::Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    if std::fs::read(path).is_ok_and(|old| old == data.as_ref()) {
+        return Ok(());
+    }
+    std::fs::write(path, data)
+}
+
 /// Largest amount of x86 code (bytes) one split unit may hold.
 pub const UNIT_BYTES: usize = 600_000;
 
@@ -149,16 +158,16 @@ pub fn lift_image_split(
         is_func: &is_func,
     };
     std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join("rt.h"), lift::RT_HEADER)?;
-    std::fs::write(dir.join("rt_host.c"), RT_HOST_C)?;
-    std::fs::write(dir.join("rt_unit.c"), RT_UNIT_C)?;
+    write_if_changed(&dir.join("rt.h"), lift::RT_HEADER)?;
+    write_if_changed(&dir.join("rt_host.c"), RT_HOST_C)?;
+    write_if_changed(&dir.join("rt_unit.c"), RT_UNIT_C)?;
     let mut all: Vec<u64> = starts.iter().copied().collect();
     all.sort_unstable();
     let pads: Vec<(u64, u64)> = funcs
         .iter()
         .flat_map(|(f, _)| landing_pads(img, f).into_iter().map(move |p| (base + f.begin as u64, p)))
         .collect();
-    std::fs::write(dir.join("table.c"), lift::table_unit(base, &all, &pads))?;
+    write_if_changed(&dir.join("table.c"), lift::table_unit(base, &all, &pads))?;
     // Units are `per_unit` functions, further cut so no unit holds more than UNIT_BYTES of x86 code
     // (a few giant functions would otherwise make one unit take far longer than the rest).
     let (old, new): (Vec<_>, Vec<_>) = funcs.iter().cloned().partition(|(f, _)| extra.is_empty() || plain.contains(&f.begin));
@@ -211,7 +220,7 @@ pub fn lift_image_split(
                         let u = lift::lift_part(&ctx, &fins);
                         lifted.fetch_add(u.lifted.len(), Relaxed);
                         stubbed.fetch_add(u.failed.len(), Relaxed);
-                        std::fs::write(dir.join(format!("{name}.c")), u.c)?;
+                        write_if_changed(&dir.join(format!("{name}.c")), u.c)?;
                     }
                 })
             })
@@ -355,4 +364,117 @@ pub fn unresolved_jmp_shapes(img: &Image) -> Result<Vec<(String, u64)>> {
     let mut v: Vec<_> = m.into_iter().collect();
     v.sort_by_key(|a| std::cmp::Reverse(a.1));
     Ok(v)
+}
+
+/// What the static checks of [`check_image`] found.
+#[derive(Default, Debug)]
+pub struct CheckReport {
+    pub functions: usize,
+    /// Pairs of functions whose extents overlap (a hard error: some code would be lifted twice).
+    pub overlaps: Vec<(u32, u32)>,
+    /// Functions whose decode hit an invalid instruction (a hard error).
+    pub undecodable: Vec<u32>,
+    /// Jump tables recovered, and those with a case that is not an instruction start of the function.
+    pub tables: usize,
+    pub tables_with_bad_cases: Vec<(u32, usize)>,
+    /// Tables whose size came from a range check (the rest ran as far as their entries stayed in code).
+    pub bounded_tables: usize,
+    /// `jmp reg` with no recovered table (a tail call or an unrecovered switch: routed through the dispatcher).
+    pub untabled_jumps: usize,
+    /// Direct calls and jumps whose target is in no function and not a label of the caller (routed through the dispatcher).
+    pub unresolved_direct: usize,
+    /// Functions whose last instruction does not end the flow: they fall into whatever follows.
+    pub falls_through: Vec<u32>,
+}
+
+impl CheckReport {
+    /// Errors that must stop a lift.
+    pub fn hard_errors(&self) -> usize {
+        self.overlaps.len() + self.undecodable.len()
+    }
+
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "functions                         {}", self.functions);
+        let _ = writeln!(s, "overlapping extents (hard)        {}", self.overlaps.len());
+        let _ = writeln!(s, "undecodable functions (hard)      {}", self.undecodable.len());
+        let _ = writeln!(s, "jump tables                       {} ({} bounded by a range check)", self.tables, self.bounded_tables);
+        let _ = writeln!(s, "  with a case on no instruction   {}", self.tables_with_bad_cases.len());
+        let _ = writeln!(s, "jmp reg with no table             {}", self.untabled_jumps);
+        let _ = writeln!(s, "direct targets in no function     {}", self.unresolved_direct);
+        let _ = writeln!(s, "functions that fall through       {}", self.falls_through.len());
+        let mut worst = self.tables_with_bad_cases.clone();
+        worst.sort_by_key(|x| std::cmp::Reverse(x.1));
+        for (f, n) in worst.iter().take(5) {
+            let _ = writeln!(s, "  worst table with bad cases: function {f:#x}: {n}");
+        }
+        for (a, b) in self.overlaps.iter().take(5) {
+            let _ = writeln!(s, "  overlap: {a:#x} and {b:#x}");
+        }
+        for f in self.undecodable.iter().take(5) {
+            let _ = writeln!(s, "  undecodable: {f:#x}");
+        }
+        for f in self.falls_through.iter().take(5) {
+            let _ = writeln!(s, "  falls through: {f:#x}");
+        }
+        s
+    }
+}
+
+/// Static checks over every function of an image, as the lifter will see them: extents that overlap, code that does not
+/// decode, jump-table cases that land on no instruction, indirect and direct transfers the dispatcher has to resolve,
+/// and functions that fall off their end.
+pub fn check_image(img: &Image) -> Result<CheckReport> {
+    use iced_x86::{FlowControl as FC, Mnemonic};
+    let all = discover::discover(img)?;
+    let funcs: Vec<Func> = all.iter().filter(|f| !f.chained).copied().collect();
+    let mut r = CheckReport { functions: funcs.len(), ..Default::default() };
+    let base = img.info.image_base;
+    let starts: HashSet<u64> = funcs.iter().map(|f| base + f.begin as u64).collect();
+    for w in funcs.windows(2) {
+        if w[0].end > w[1].begin {
+            r.overlaps.push((w[0].begin, w[1].begin));
+        }
+    }
+    for f in &funcs {
+        let (ins, bad) = analyze::decode_function(img, f);
+        if bad {
+            r.undecodable.push(f.begin);
+        }
+        let ips: HashSet<u64> = ins.iter().map(|i| i.ip()).collect();
+        let tables = analyze::find_jump_tables(img, f, &ins);
+        let tabled: HashSet<u64> = tables.iter().map(|t| base + t.jmp_rva as u64).collect();
+        r.tables += tables.len();
+        r.bounded_tables += tables.iter().filter(|t| t.bounded).count();
+        let bad_cases: usize = tables
+            .iter()
+            .map(|t| t.targets.iter().filter(|&&x| (f.begin..f.end).contains(&x) && !ips.contains(&(base + x as u64))).count())
+            .sum();
+        if bad_cases > 0 {
+            r.tables_with_bad_cases.push((f.begin, bad_cases));
+        }
+        for i in &ins {
+            match i.flow_control() {
+                FC::IndirectBranch if i.op0_kind() == iced_x86::OpKind::Register && !tabled.contains(&i.ip()) => r.untabled_jumps += 1,
+                FC::Call | FC::UnconditionalBranch | FC::ConditionalBranch if i.op0_kind() == iced_x86::OpKind::NearBranch64 => {
+                    let t = i.near_branch_target();
+                    if !starts.contains(&t) && !ips.contains(&t) {
+                        r.unresolved_direct += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(last) = ins.last() {
+            let ends = matches!(last.flow_control(), FC::Return | FC::UnconditionalBranch | FC::IndirectBranch)
+                || matches!(last.mnemonic(), Mnemonic::Int3 | Mnemonic::Ud2 | Mnemonic::Hlt)
+                // A call that never returns (`__fastfail`, a noreturn helper) ends functions as well.
+                || last.flow_control() == FC::Call;
+            if !ends {
+                r.falls_through.push(f.begin);
+            }
+        }
+    }
+    Ok(r)
 }

@@ -344,3 +344,11 @@ Done in stage 4: the runtime (dispatch, imports, callbacks, CPUID), an arm64 hos
 8. A per-site inline cache or direct call table for the hot indirect calls, if profiling shows the hash lookup matters.
 
 Sources for the TSO notes: [Apple silicon TSO study (ASPLOS 2026)](https://www.cs.tau.ac.il/~mad/publications/asplos2026-TSO.pdf) and [the 2024 arm64 TSO prctl thread](https://lists.infradead.org/pipermail/linux-arm-kernel/2024-May/926327.html). Neither says whether macOS lets a native process enable it.
+
+### Where the arm64 title run stopped (branch `native/arm64-run`)
+
+Paused by the owner: Rosetta is the main path. State: the lifted title maps and binds with all title DLLs, runs its entry on arm64 headless, reaches PresentX (frames 1 to 4 with draws), and the last trap seen was a jump-table case missing from a switch (found by `lift-split` seeds; see `extra-seeds.txt` in the scratch lift folder). Open items, in order:
+1. The instruction-form differential test (`tests/diff_forms.rs`, commit d0e57de, `victory-recomp forms <pe>` lists the title's forms) found three lifter bugs. One of them (`vset`: both halves of a 256-bit result are computed before either is written) touches every wide VEX op, so the title needs a full rebuild before the next run.
+2. Static lift-time checks: `victory-recomp check <pe>` exists as a first cut (overlaps, undecodable functions, tables with bad cases, untabled `jmp reg`, unresolved direct targets, fall-through); the title reports 4 undecodable functions and 208 that fall through, not triaged. `lift-split` only warns for now.
+3. Content-hash incremental rebuilds: `lift-split` now rewrites only changed files (`write_if_changed`), so make recompiles only changed units; a header change still rebuilds everything.
+Build line used for the title: `clang -O2 -ffp-contract=off -mcpu=apple-m1 -mllvm -disable-machine-sink -mllvm -enable-misched=false -DRT_TSO` (the scheduler flag cut an 11 MB unit from 13+ minutes to 95 s).

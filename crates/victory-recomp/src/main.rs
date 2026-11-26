@@ -50,6 +50,12 @@ fn main() -> Result<()> {
                     .collect(),
                 None => vec![],
             };
+            let checks = victory_recomp::check_image(&img)?;
+            eprint!("{}", checks.render());
+            // Not yet fatal (step 2 is unfinished: the 4 undecodable functions of the title are known); `check` exits non-zero.
+            if checks.hard_errors() > 0 {
+                eprintln!("warning: {} hard errors in the static checks", checks.hard_errors());
+            }
             let t = std::time::Instant::now();
             let (n, ok, stub, units) = victory_recomp::lift_image_split(&img, &dir, per, &extra)?;
             eprintln!(
@@ -70,6 +76,14 @@ fn main() -> Result<()> {
             v.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c as u32));
             for (c, n) in v {
                 println!("{c:?} {n}");
+            }
+        }
+        "check" => {
+            // Static checks over every function; exits non-zero on hard errors.
+            let r = victory_recomp::check_image(&img)?;
+            print!("{}", r.render());
+            if r.hard_errors() > 0 {
+                bail!("{} hard errors", r.hard_errors());
             }
         }
         "tables" => {
