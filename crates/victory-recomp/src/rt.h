@@ -16,18 +16,58 @@ typedef struct { u8 k, sz; u64 a, b, r, c; } Fl;
 
 /* Architectural state shared across lifted function boundaries. */
 /* x = low 128 bits of ymm0..15, xh = high 128 bits. Win64 treats the upper halves as volatile, but vectorcall can pass ymm. */
-typedef struct { u64 r[16]; X128 x[16]; X128 xh[16]; } Cpu;
+typedef struct {
+  u64 r[16]; X128 x[16]; X128 xh[16];
+  /* What `gs:` addresses: the thread's TEB. The lifter reads `c->gs_base + offset` for a gs: access, so the TEB
+   * travels with the Cpu (an arm64 process has no free segment register). Set once per guest thread, never spilled. */
+  u64 gs_base;
+} Cpu;
 
 extern u8 *IMG;      /* host address of RVA 0 */
-extern u8 *rt_gs;    /* GS base: TEB (or the per-thread block the host chooses) */
 #define H(va) ((u8 *)(IMG + ((va) - IMAGE_BASE)))
 
-/* Host hooks. rt_dispatch resolves a guest address to lifted code; anything it
- * cannot resolve (HLE import, JIT, unknown) goes to rt_unresolved. */
+/* ---- Host runtime (rt_host.c) ---- */
+typedef void (*RtFn)(Cpu *);
+/* rt_dispatch resolves a guest address to lifted code (hash over the generated rt_table), to an import
+ * thunk (an IAT slot value from rt_import_bind), or to rt_unresolved, which logs the address and hands it
+ * to the pluggable fallback (interpreter, JIT helper) or aborts. */
 void rt_dispatch(Cpu *c, u64 target);
 void rt_unresolved(Cpu *c, u64 target);
 void rt_trap(const char *why);
+typedef void (*RtFallback)(Cpu *c, u64 target);
+void rt_set_fallback(RtFallback f);
+u64 rt_unresolved_count(void); /* distinct unresolved targets seen so far */
+/* Maps the table over an image already placed at `img` (size bytes): builds the lookup hash. */
+void rt_init(u8 *img, u64 size);
 
+/* Imports. A lifted call through an IAT slot lands in rt_dispatch with the slot's value, which is the thunk
+ * address rt_import_bind returned. The host function is called directly: arguments are taken from the Cpu by the
+ * Windows x64 rules (rcx rdx r8 r9 / xmm0-3 by position, then the stack after the return address and 32 bytes of
+ * shadow space) and passed by the native (AAPCS64) rules, so it can be a plain C or Rust `extern "C"` function.
+ * At most 8 integer and 8 floating-point arguments. `raw`, if set, is called with the Cpu instead. */
+enum { RT_RET_I64, RT_RET_I32, RT_RET_F64, RT_RET_F32, RT_RET_VOID };
+typedef struct {
+  const char *name;
+  void *fn;           /* typed host function */
+  RtFn raw;           /* or: void f(Cpu *) */
+  u8 argc;
+  u16 fmask, smask;   /* bit i: argument i is a double / a float */
+  u8 ret;
+} RtImport;
+u64 rt_import_bind(const RtImport *imp);
+const char *rt_import_name(u64 thunk);
+
+/* Callbacks (host to guest). Sets up a Cpu from Windows x64 arguments (bit i of fmask: argument i is a double,
+ * given as its bit pattern), runs the guest function at `target` on the thread's guest stack (below the
+ * innermost running lifted frame if called from an import) and returns rax; xmm0's low qword goes to *xmm0. */
+u64 rt_call_guest(u64 target, const u64 *args, u32 n, u32 fmask, u64 *xmm0);
+/* Per-thread guest state: the TEB `gs:` addresses and the guest stack [lo, hi). A thread that never calls this
+ * gets a zeroed TEB and a 1 MiB stack on first use. */
+void rt_thread_init(u8 *gs_base, u8 *stack_lo, u8 *stack_hi);
+
+/* Thread-local accesses (the guest stack, the TEB) and the building blocks of the ordered ones: plain. */
+static inline u8 ld8(const u8 *p) { return *p; }
+static inline void st8(u8 *p, u64 v) { *p = (u8)v; }
 static inline u16 ld16(const u8 *p) { u16 v; memcpy(&v, p, 2); return v; }
 static inline u32 ld32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
 static inline u64 ld64(const u8 *p) { u64 v; memcpy(&v, p, 8); return v; }
@@ -40,6 +80,75 @@ static inline float ldf(const u8 *p) { float v; memcpy(&v, p, 4); return v; }
 static inline double ldg(const u8 *p) { double v; memcpy(&v, p, 8); return v; }
 static inline void stf(u8 *p, float v) { memcpy(p, &v, 4); }
 static inline void stg(u8 *p, double v) { memcpy(p, &v, 8); }
+
+/* Memory ordering (docs/recompiler.md, "Memory ordering"). The lifter emits `sld*`/`sst*` (shared) for every access
+ * that is not provably thread-local (anything not based on rsp or gs:), and the plain `ld*`/`st*` above for the rest.
+ *   default:      shared accesses are plain: ARM's weak model, fastest, wrong for lock-free code that relies on TSO.
+ *   -DRT_TSO:     shared loads are acquire (LDAR/LDAPR) and shared stores release (STLR), which gives x86's
+ *                 load-load, load-store and store-store ordering; a store may still pass a later load, as on x86.
+ *   -DRT_TSO_ALL: every access, stack included (to measure what the thread-local test saves).
+ * Misaligned accesses cannot be LDAR/STLR (alignment fault); they take a plain access plus a barrier. */
+#if defined(RT_TSO) || defined(RT_TSO_ALL)
+#define RT_ORD(T, N, BITS) \
+  static inline T o_ld##BITS(const u8 *p) { \
+    if (__builtin_expect(((uintptr_t)p & (N - 1)) == 0, 1)) return __atomic_load_n((const T *)p, __ATOMIC_ACQUIRE); \
+    T v; memcpy(&v, p, N); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v; } \
+  static inline void o_st##BITS(u8 *p, u64 v) { \
+    T t = (T)v; \
+    if (__builtin_expect(((uintptr_t)p & (N - 1)) == 0, 1)) { __atomic_store_n((T *)p, t, __ATOMIC_RELEASE); return; } \
+    __atomic_thread_fence(__ATOMIC_RELEASE); memcpy(p, &t, N); }
+RT_ORD(u16, 2, 16) RT_ORD(u32, 4, 32) RT_ORD(u64, 8, 64)
+static inline u8 o_ld8(const u8 *p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+static inline void o_st8(u8 *p, u64 v) { __atomic_store_n(p, (u8)v, __ATOMIC_RELEASE); }
+/* 128-bit accesses have no LDAR/STLR: a barrier around the plain access. */
+static inline X128 o_ld128(const u8 *p) { X128 v = ld128(p); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v; }
+static inline void o_st128(u8 *p, X128 v) { __atomic_thread_fence(__ATOMIC_RELEASE); st128(p, v); }
+static inline float o_ldf(const u8 *p) { u32 v = o_ld32(p); float f; memcpy(&f, &v, 4); return f; }
+static inline double o_ldg(const u8 *p) { u64 v = o_ld64(p); double f; memcpy(&f, &v, 8); return f; }
+static inline void o_stf(u8 *p, float f) { u32 v; memcpy(&v, &f, 4); o_st32(p, v); }
+static inline void o_stg(u8 *p, double f) { u64 v; memcpy(&v, &f, 8); o_st64(p, v); }
+static inline X128 o_ldx8(const u8 *p) { X128 r; r.q[0] = r.q[1] = 0; r.b[0] = o_ld8(p); return r; }
+static inline X128 o_ldx16(const u8 *p) { X128 r; r.q[0] = r.q[1] = 0; r.w[0] = o_ld16(p); return r; }
+static inline X128 o_ldx32(const u8 *p) { X128 r; r.q[0] = r.q[1] = 0; r.d[0] = o_ld32(p); return r; }
+static inline X128 o_ldx64(const u8 *p) { X128 r; r.q[0] = o_ld64(p); r.q[1] = 0; return r; }
+#define sld8 o_ld8
+#define sst8 o_st8
+#define sld16 o_ld16
+#define sld32 o_ld32
+#define sld64 o_ld64
+#define sst16 o_st16
+#define sst32 o_st32
+#define sst64 o_st64
+#define sld128 o_ld128
+#define sst128 o_st128
+#define sldf o_ldf
+#define sldg o_ldg
+#define sstf o_stf
+#define sstg o_stg
+#define sldx8 o_ldx8
+#define sldx16 o_ldx16
+#define sldx32 o_ldx32
+#define sldx64 o_ldx64
+#else
+#define sld8 ld8
+#define sst8 st8
+#define sld16 ld16
+#define sld32 ld32
+#define sld64 ld64
+#define sst16 st16
+#define sst32 st32
+#define sst64 st64
+#define sld128 ld128
+#define sst128 st128
+#define sldf ldf
+#define sldg ldg
+#define sstf stf
+#define sstg stg
+#define sldx8 ldx8
+#define sldx16 ldx16
+#define sldx32 ldx32
+#define sldx64 ldx64
+#endif
 
 #define MASK(n) ((n) == 64 ? ~0ull : ((1ull << (n)) - 1))
 static inline u64 sx(u64 v, int bits) { return (u64)((s64)(v << (64 - bits)) >> (64 - bits)); }
@@ -147,9 +256,8 @@ static inline s32 cvtt32(double v) { return (v != v || v >= 2147483648.0 || v <=
       r8=c->r[8],r9=c->r[9],r10=c->r[10],r11=c->r[11],r12=c->r[12],r13=c->r[13],r14=c->r[14],r15=c->r[15]; \
   X128 x0=c->x[0],x1=c->x[1],x2=c->x[2],x3=c->x[3],x4=c->x[4],x5=c->x[5],x6=c->x[6],x7=c->x[7], \
        x8=c->x[8],x9=c->x[9],x10=c->x[10],x11=c->x[11],x12=c->x[12],x13=c->x[13],x14=c->x[14],x15=c->x[15]; \
-  Fl F = {0}; (void)F; (void)rt_gs
+  Fl F = {0}; (void)F
 
-typedef void (*RtFn)(Cpu *);
 typedef struct { u32 rva; RtFn fn; } RtEntry;
 extern const RtEntry rt_table[];
 extern const unsigned rt_table_n;

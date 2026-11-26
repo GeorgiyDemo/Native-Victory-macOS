@@ -1,0 +1,7 @@
+LIBRARY host.dll
+EXPORTS
+host_add3
+host_mix
+host_sum8
+host_callback
+host_puts

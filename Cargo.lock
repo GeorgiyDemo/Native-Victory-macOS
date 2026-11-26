@@ -771,6 +771,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-rt"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "victory-pe",
+ "victory-recomp",
+]
+
+[[package]]
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [

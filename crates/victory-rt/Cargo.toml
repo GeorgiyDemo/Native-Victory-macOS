@@ -1,0 +1,16 @@
+[package]
+name = "victory-rt"
+description = "Native arm64 host for statically recompiled title code: maps the image, binds imports to Rust functions, runs exports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+victory-recomp.workspace = true
+victory-pe.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

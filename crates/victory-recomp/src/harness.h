@@ -13,7 +13,6 @@
 
 #ifndef LIFTED
 u8 *IMG;
-u8 *rt_gs;
 #endif
 
 /* Loads a flat image (RVA-addressed) to IMG. */
@@ -30,6 +29,9 @@ static void load_image(const char *path) {
   if (IMG == MAP_FAILED) { perror("mmap"); exit(2); }
   if (fread(IMG, 1, (size_t)n, f) != (size_t)n) exit(2);
   fclose(f);
+#ifdef LIFTED
+  rt_init(IMG, sz);
+#endif
 }
 
 /* integer args/result */

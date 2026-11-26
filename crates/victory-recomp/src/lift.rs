@@ -228,7 +228,7 @@ impl L<'_> {
         p.push(format!("(u64)(s64){}ll", i.memory_displacement64() as i64));
         let sum = p.join(" + ");
         Ok(match i.segment_prefix() {
-            Register::GS => format!("(u8*)((u64)rt_gs + {sum})"),
+            Register::GS => format!("(u8*)(c->gs_base + {sum})"),
             Register::None | Register::DS | Register::ES | Register::SS | Register::CS => {
                 format!("(u8*)({sum})")
             }
@@ -254,7 +254,7 @@ impl L<'_> {
             OpKind::Memory => {
                 let a = self.addr(i)?;
                 match Self::mem_bits(i) {
-                    8 => format!("(u64)*(u8*)({a})"),
+                    8 => format!("(u64)ld8({a})"),
                     16 => format!("(u64)ld16({a})"),
                     32 => format!("(u64)ld32({a})"),
                     64 => format!("ld64({a})"),
@@ -295,7 +295,7 @@ impl L<'_> {
             OpKind::Memory => {
                 let a = self.addr(i)?;
                 match Self::mem_bits(i) {
-                    8 => format!("*(u8*)({a}) = (u8)({v});"),
+                    8 => format!("st8({a}, {v});"),
                     16 => format!("st16({a}, {v});"),
                     32 => format!("st32({a}, {v});"),
                     64 => format!("st64({a}, {v});"),
@@ -677,7 +677,22 @@ impl L<'_> {
         Ok(true)
     }
 
+    /// Lifts one instruction. Memory accesses that are not provably thread-local (not based on rsp, not
+    /// `gs:`) are emitted as `sld*`/`sst*`, which the C header turns into acquire/release accesses under
+    /// `-DRT_TSO`; the rest stay plain `ld*`/`st*`.
     fn insn(&mut self, i: &Instruction, labels: &BTreeSet<u64>) -> R<()> {
+        let start = self.o.len();
+        self.insn_inner(i, labels)?;
+        let local = i.segment_prefix() == Register::GS || i.memory_base() == Register::RSP;
+        if !local && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory) {
+            let tail = shared_accesses(&self.o[start..]);
+            self.o.truncate(start);
+            self.o.push_str(&tail);
+        }
+        Ok(())
+    }
+
+    fn insn_inner(&mut self, i: &Instruction, labels: &BTreeSet<u64>) -> R<()> {
         use Mnemonic as M;
         if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repe_prefix() || i.has_repne_prefix()
         {
@@ -936,6 +951,40 @@ impl L<'_> {
         }
         Ok(())
     }
+}
+
+/// Accessors whose shared (possibly ordered) form is the same name with an `s` in front.
+const ACCESSORS: [&str; 18] = [
+    "ld8", "st8", "ld16", "ld32", "ld64", "st16", "st32", "st64", "ld128", "st128", "ldf", "ldg", "stf", "stg",
+    "ldx8", "ldx16", "ldx32", "ldx64",
+];
+
+/// Renames the accessor calls in `code` to their shared forms, except the implicit stack accesses
+/// (`ld64((u8*)r4)` and friends: push, pop, call, ret).
+fn shared_accesses(code: &str) -> String {
+    let b = code.as_bytes();
+    let mut out = String::with_capacity(code.len() + 16);
+    let mut k = 0;
+    while k < b.len() {
+        let word_start = b[k].is_ascii_alphabetic() && (k == 0 || !(b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_'));
+        if word_start {
+            let mut e = k;
+            while e < b.len() && (b[e].is_ascii_alphanumeric() || b[e] == b'_') {
+                e += 1;
+            }
+            let w = &code[k..e];
+            let stack = code[e..].starts_with("((u8*)r4");
+            if ACCESSORS.contains(&w) && code[e..].starts_with('(') && !stack {
+                out.push('s');
+            }
+            out.push_str(w);
+            k = e;
+        } else {
+            out.push(b[k] as char);
+            k += 1;
+        }
+    }
+    out
 }
 
 /// VEX instruction that names an xmm/ymm register, or vzeroupper/vzeroall.

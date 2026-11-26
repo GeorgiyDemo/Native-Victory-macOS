@@ -374,3 +374,25 @@ static inline X128 h_insertq(X128 d, X128 s, unsigned len, unsigned idx) {
   len &= 63; idx &= 63; u64 m = fld_mask(len) << idx; d.q[0] = (d.q[0] & ~m) | ((s.q[0] << idx) & m); return d;
 }
 static inline X128 h_extrq(X128 d, unsigned len, unsigned idx) { len &= 63; idx &= 63; d.q[0] = (d.q[0] >> idx) & fld_mask(len); return d; }
+
+/* -DRT_TSO_ALL: thread-local accesses are ordered too. Defined last so the ordered helpers above still use the plain ones. */
+#ifdef RT_TSO_ALL
+#define ld8 o_ld8
+#define st8 o_st8
+#define ld16 o_ld16
+#define ld32 o_ld32
+#define ld64 o_ld64
+#define st16 o_st16
+#define st32 o_st32
+#define st64 o_st64
+#define ld128 o_ld128
+#define st128 o_st128
+#define ldf o_ldf
+#define ldg o_ldg
+#define stf o_stf
+#define stg o_stg
+#define ldx8 o_ldx8
+#define ldx16 o_ldx16
+#define ldx32 o_ldx32
+#define ldx64 o_ldx64
+#endif
