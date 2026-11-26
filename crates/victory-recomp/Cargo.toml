@@ -13,7 +13,7 @@ iced-x86.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
-iced-x86 = { workspace = true, features = ["code_asm"] }
+iced-x86 = { workspace = true, features = ["code_asm", "op_code_info", "instr_info"] }
 
 [lints]
 workspace = true

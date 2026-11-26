@@ -62,7 +62,8 @@ impl L<'_> {
 
     fn vset(d: usize, wide: bool, lo: &str, hi: &str) -> String {
         if wide {
-            format!("x{d} = {lo}; xh{d} = {hi};")
+            // Both halves are computed before either is written: the destination may be a source of the other half.
+            format!("{{ X128 vl_ = {lo}; X128 vh_ = {hi}; x{d} = vl_; xh{d} = vh_; }}")
         } else {
             format!("x{d} = {lo}; xh{d} = xz();")
         }

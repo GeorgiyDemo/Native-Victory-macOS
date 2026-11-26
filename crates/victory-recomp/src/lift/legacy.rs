@@ -299,7 +299,7 @@ impl L<'_> {
                 let (d, s) = (Self::xdst(i)?, self.x128(i, 1)?);
                 let imm = i.immediate(2) as u8;
                 let explicit = matches!(m, M::Pcmpestri | M::Pcmpestrm);
-                let (la, lb) = if explicit { ("(s32)r0", "(s32)r2") } else { ("(-0x7fffffff-1)", "(-0x7fffffff-1)") };
+                let (la, lb) = if explicit { ("(s64)(s32)r0", "(s64)(s32)r2") } else { ("(-0x7fffffffffffffffll-1)", "(-0x7fffffffffffffffll-1)") };
                 let out = if matches!(m, M::Pcmpistri | M::Pcmpestri) { "r1 = ix;" } else { "x0 = mk;" };
                 self.emit(&format!(
                     "{{ X128 mk; u32 ix = h_pcmpstr(x{d}, {s}, {la}, {lb}, {imm}, &F, &mk); {out} }}"

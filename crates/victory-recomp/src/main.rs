@@ -57,6 +57,21 @@ fn main() -> Result<()> {
                 t.elapsed().as_secs_f64()
             );
         }
+        "forms" => {
+            // Every distinct instruction form (iced `Code`: mnemonic, operand kinds, prefixes) in the image with its
+            // count, most used first: names and counts only, no bytes (input for `VICTORY_FORMS_LIST` of the form test).
+            let mut counts: std::collections::HashMap<iced_x86::Code, u64> = Default::default();
+            for f in victory_recomp::discover::discover(&img)? {
+                for i in victory_recomp::analyze::decode_function(&img, &f).0 {
+                    *counts.entry(i.code()).or_default() += 1;
+                }
+            }
+            let mut v: Vec<_> = counts.into_iter().collect();
+            v.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c as u32));
+            for (c, n) in v {
+                println!("{c:?} {n}");
+            }
+        }
         "tables" => {
             // The function holding an RVA, and the jump tables recovered in it (a debugging aid for a trap in a switch).
             let rva = u32::from_str_radix(args.get(3).context(USAGE)?.trim_start_matches("0x"), 16)?;

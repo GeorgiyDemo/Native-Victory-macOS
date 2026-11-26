@@ -400,8 +400,9 @@ static inline X128 h_extrq(X128 d, unsigned len, unsigned idx) { len &= 63; idx 
 /* dpps: products selected by imm[7:4], summed as (p0 + p1) + (p2 + p3), copied to the lanes imm[3:0] selects. */
 static inline X128 h_vdpps(X128 a, X128 b, int imm) {
   float p[4]; X128 r;
-  for (int k = 0; k < 4; k++) p[k] = (imm >> (4 + k) & 1) ? a.f[k] * b.f[k] : 0.0f;
-  float s = (p[0] + p[1]) + (p[2] + p[3]);
+  for (int k = 0; k < 4; k++) p[k] = (imm >> (4 + k) & 1) ? nanfix_f(a.f[k] * b.f[k], a.f[k], b.f[k]) : 0.0f;
+  float s0 = nanfix_f(p[0] + p[1], p[0], p[1]), s1 = nanfix_f(p[2] + p[3], p[2], p[3]);
+  float s = nanfix_f(s0 + s1, s0, s1);
   LP(4) r.f[k] = (imm >> k & 1) ? s : 0.0f;
   return r;
 }
@@ -421,18 +422,18 @@ static inline u32 h_crc32c(u32 crc, u64 v, int bytes) {
   return crc;
 }
 
-/* SSE4.2 pcmpistri/pcmpestri/pcmpistrm/pcmpestrm (SDM 4.1.x): la/lb are the explicit lengths, INT_MIN for implicit
+/* SSE4.2 pcmpistri/pcmpestri/pcmpistrm/pcmpestrm (SDM 4.1.x): la/lb are the explicit lengths, INT64_MIN for implicit
  * (up to the first zero element). Sets ZF/SF/CF/OF in f, the expanded or bit mask in *mk, returns the index. */
-static inline u32 h_pcmpstr(X128 a, X128 b, int la, int lb, int imm, Fl *f, X128 *mk) {
+static inline u32 h_pcmpstr(X128 a, X128 b, long long la, long long lb, int imm, Fl *f, X128 *mk) {
   int n = (imm & 1) ? 8 : 16, sgn = (imm >> 1) & 1, agg = (imm >> 2) & 3;
   s64 ea[16], eb[16];
   for (int k = 0; k < n; k++) {
     if (n == 16) { ea[k] = sgn ? (s64)a.sb[k] : (s64)a.b[k]; eb[k] = sgn ? (s64)b.sb[k] : (s64)b.b[k]; }
     else { ea[k] = sgn ? (s64)a.sw[k] : (s64)a.w[k]; eb[k] = sgn ? (s64)b.sw[k] : (s64)b.w[k]; }
   }
-  if (la == (-0x7fffffff - 1)) { la = 0; while (la < n && (n == 16 ? a.b[la] : a.w[la])) la++; }
+  if (la == (-0x7fffffffffffffffll - 1)) { la = 0; while (la < n && (n == 16 ? a.b[la] : a.w[la])) la++; }
   else { if (la < 0) la = -la; if (la > n) la = n; }
-  if (lb == (-0x7fffffff - 1)) { lb = 0; while (lb < n && (n == 16 ? b.b[lb] : b.w[lb])) lb++; }
+  if (lb == (-0x7fffffffffffffffll - 1)) { lb = 0; while (lb < n && (n == 16 ? b.b[lb] : b.w[lb])) lb++; }
   else { if (lb < 0) lb = -lb; if (lb > n) lb = n; }
   unsigned res = 0;
   for (int j = 0; j < n; j++) {

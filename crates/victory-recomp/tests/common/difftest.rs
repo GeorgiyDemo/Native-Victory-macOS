@@ -23,6 +23,11 @@ pub enum Kind {
     Fl,
     /// Integer-register inputs that are random/special float64 bit patterns.
     Db,
+    /// Integer-register inputs, a 1 KiB output buffer printed whole (the instruction-form tests).
+    Wide,
+    /// [`Kind::Wide`] with packed float32 / float64 edge-value inputs.
+    WideFl,
+    WideDb,
     /// Only called from other snippets.
     Helper,
 }
@@ -201,28 +206,40 @@ static u32 fg32(void) {
 }
 static u64 fg(void) { u64 lo = fg32(); return lo | (u64)fg32() << 32; }
 static u64 dgbits(void) { double d = dg(); u64 b; memcpy(&b, &d, 8); return b; }
+static void show1k(const char *n, const u8 *o) {
+  u64 w[128]; memcpy(w, o, 1024);
+  printf("%s", n); for (int k = 0; k < 128; k++) printf(" %llx", (unsigned long long)w[k]); printf("\n");
+}
 static void show(const char *n, const u8 *o) {
   u64 w[32]; memcpy(w, o, 256);
   printf("%s", n); for (int k = 0; k < 32; k++) printf(" %llx", (unsigned long long)w[k]); printf("\n");
 }
 int main(int argc, char **argv) {
   (void)argc; setvbuf(stdout, 0, _IOLBF, 0); load_image(argv[1]);
-  u8 out[256];
+  u8 out[1024];
+  int sel = argc > 2 ? atoi(argv[2]) : -1; /* only call number `sel` (to find the one that crashes) */
+  int calln;
   for (int it = 0; it < 300; it++) {
+    calln = 0;
     u64 a = ig(), b = ig(); if (rnd() % 5 == 0) b = a; else if (rnd() % 9 == 0) b = a + 1;
     double x = dg(), y = dg(); if (rnd() % 6 == 0) y = x;
     u64 fa = fg(), fb = fg(); if (rnd() % 6 == 0) fb = fa; u64 da = dgbits(), db = dgbits(); if (rnd() % 6 == 0) db = da;
     (void)a; (void)b; (void)x; (void)y; (void)fa; (void)fb; (void)da; (void)db;
 "#,
     );
-    for (name, rva, kind) in calls {
+    for (n, (name, rva, kind)) in calls.iter().enumerate() {
+        write!(s, "    if (sel < 0 || sel == {n}) {{ ").unwrap();
         match kind {
             Kind::Int => writeln!(s, "    memset(out, 0, 256); fi({rva:#x}, a, b, out); printf(\"%llx %llx \", (unsigned long long)a, (unsigned long long)b); show(\"{name}\", out);").unwrap(),
             Kind::Fl => writeln!(s, "    memset(out, 0, 256); fi({rva:#x}, fa, fb, out); printf(\"%llx %llx \", (unsigned long long)fa, (unsigned long long)fb); show(\"{name}\", out);").unwrap(),
             Kind::Db => writeln!(s, "    memset(out, 0, 256); fi({rva:#x}, da, db, out); printf(\"%llx %llx \", (unsigned long long)da, (unsigned long long)db); show(\"{name}\", out);").unwrap(),
             Kind::Fp => writeln!(s, "    memset(out, 0, 256); fd({rva:#x}, x, y, out); printf(\"%016llx %016llx \", *(unsigned long long *)&x, *(unsigned long long *)&y); show(\"{name}\", out);").unwrap(),
+            Kind::Wide => writeln!(s, "memset(out, 0, 1024); fi({rva:#x}, a, b, out); printf(\"%llx %llx \", (unsigned long long)a, (unsigned long long)b); show1k(\"{name}\", out);").unwrap(),
+            Kind::WideFl => writeln!(s, "memset(out, 0, 1024); fi({rva:#x}, fa, fb, out); printf(\"%llx %llx \", (unsigned long long)fa, (unsigned long long)fb); show1k(\"{name}\", out);").unwrap(),
+            Kind::WideDb => writeln!(s, "memset(out, 0, 1024); fi({rva:#x}, da, db, out); printf(\"%llx %llx \", (unsigned long long)da, (unsigned long long)db); show1k(\"{name}\", out);").unwrap(),
             Kind::Helper => {}
         }
+        s.push_str("}\n");
     }
     s.push_str("  }\n  return 0;\n}\n");
     s
