@@ -57,6 +57,24 @@ fn main() -> Result<()> {
                 t.elapsed().as_secs_f64()
             );
         }
+        "tables" => {
+            // The function holding an RVA, and the jump tables recovered in it (a debugging aid for a trap in a switch).
+            let rva = u32::from_str_radix(args.get(3).context(USAGE)?.trim_start_matches("0x"), 16)?;
+            let all = victory_recomp::discover::discover(&img)?;
+            let f = all.iter().find(|f| f.begin <= rva && rva < f.end).context("no function holds it")?;
+            println!("function {:#x}..{:#x}", f.begin, f.end);
+            let (ins, _) = victory_recomp::analyze::decode_function(&img, f);
+            let ips: std::collections::HashSet<u64> = ins.iter().map(|i| i.ip()).collect();
+            for t in victory_recomp::analyze::find_jump_tables(&img, f, &ins) {
+                let bad: Vec<String> = t
+                    .targets
+                    .iter()
+                    .filter(|&&x| !ips.contains(&(img.info.image_base + x as u64)))
+                    .map(|x| format!("{x:#x}"))
+                    .collect();
+                println!("jmp at {:#x}: table {:#x}, {} targets, not instruction starts: {bad:?}", t.jmp_rva, t.table_rva, t.targets.len());
+            }
+        }
         "jmpshapes" => {
             for (k, v) in victory_recomp::unresolved_jmp_shapes(&img)?.iter().take(25) {
                 println!("{v:>6}  {k}");

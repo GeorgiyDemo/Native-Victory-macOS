@@ -981,7 +981,12 @@ impl L<'_> {
                     let r = self.rd(i, 0, 64)?;
                     // No recovered table: a tail call through a register (or a switch we could not
                     // decode); hand it to the dispatcher, which logs it if it is not a function start.
-                    let Some(ts) = self.f.tables.get(&i.ip()).filter(|ts| ts.iter().all(|t| self.ips.contains(t) || !self.inside(*t))) else {
+                    // Cases that fall inside the function but on no instruction (the table ran on into other data) are left
+                    // out; one that is hit anyway traps.
+                    let usable: Option<Vec<u64>> = self.f.tables.get(&i.ip()).map(|ts| {
+                        ts.iter().copied().filter(|t| self.ips.contains(t) || !self.inside(*t)).collect()
+                    });
+                    let Some(ts) = usable.filter(|ts| !ts.is_empty()) else {
                         self.emit(&format!("{{ u64 t = {r}; {}; rt_dispatch(c, t); return; }}", self.sp()));
                         return Ok(());
                     };
@@ -1152,7 +1157,8 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     }
     let ipset: std::collections::HashSet<u64> = f.ins.iter().map(|i| i.ip()).collect();
     let inside = |t: &u64| (f.begin_va..f.end_va).contains(t) || f.extra.iter().any(|&(b, e)| (b..e).contains(t));
-    for ts in f.tables.values().filter(|ts| ts.iter().all(|t| ipset.contains(t) || !inside(t))) {
+    let _ = inside;
+    for ts in f.tables.values() {
         labels.extend(ts.iter().copied().filter(|t| ipset.contains(t)));
     }
     let pads: Vec<u64> = f.landing_pads.iter().copied().filter(|p| ipset.contains(p)).collect();

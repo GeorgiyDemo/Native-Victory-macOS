@@ -21,26 +21,91 @@ pub struct JumpTable {
     pub table_rva: u32,
     /// Target RVAs, all inside the owning function.
     pub targets: Vec<u32>,
+    /// The size came from a range check on the index (else the table ran as far as its entries stayed in code).
+    pub bounded: bool,
 }
 
 /// Decodes one function. Returns instructions and whether decoding hit garbage.
+///
+/// Linear, then resynchronised: data inside the range (a table of case bytes after a `jmp`, constants) throws the linear
+/// decode off until it happens to realign, so every branch target and jump-table case that is not an instruction start
+/// is decoded from there on (the junk that overlaps it is dropped), until nothing new turns up.
 pub fn decode_function(img: &Image, f: &Func) -> (Vec<Instruction>, bool) {
     let Some(code) = img.bytes(f.begin, (f.end - f.begin) as usize) else {
         return (vec![], true);
     };
-    let ip = img.info.image_base + f.begin as u64;
-    let mut dec = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
-    let mut out = Vec::with_capacity(code.len() / 4);
+    let base = img.info.image_base;
+    let ip0 = base + f.begin as u64;
+    let end_ip = base + f.end as u64;
     let mut bad = false;
-    while dec.can_decode() {
-        let i = dec.decode();
-        if i.is_invalid() {
-            bad = true;
+    let mut by_ip: std::collections::BTreeMap<u64, Instruction> = std::collections::BTreeMap::new();
+    {
+        let mut dec = Decoder::with_ip(64, code, ip0, DecoderOptions::NONE);
+        while dec.can_decode() {
+            let i = dec.decode();
+            if i.is_invalid() {
+                bad = true;
+                break;
+            }
+            by_ip.insert(i.ip(), i);
+        }
+    }
+    let mut tried: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for _ in 0..8 {
+        let mut wanted: Vec<u64> = by_ip
+            .values()
+            .filter(|i| {
+                matches!(
+                    i.flow_control(),
+                    iced_x86::FlowControl::ConditionalBranch | iced_x86::FlowControl::UnconditionalBranch
+                ) && i.op0_kind() == OpKind::NearBranch64
+            })
+            .map(|i| i.near_branch_target())
+            .collect();
+        let ins_now: Vec<Instruction> = by_ip.values().copied().collect();
+        wanted.extend(
+            find_jump_tables(img, f, &ins_now)
+                .iter()
+                .filter(|t| t.bounded)
+                .flat_map(|t| t.targets.iter().map(|&r| base + r as u64)),
+        );
+        wanted.retain(|t| (ip0..end_ip).contains(t) && !by_ip.contains_key(t) && tried.insert(*t));
+        if wanted.is_empty() {
             break;
         }
-        out.push(i);
+        for t in wanted {
+            if by_ip.contains_key(&t) {
+                continue;
+            }
+            let off = (t - ip0) as usize;
+            let mut dec = Decoder::with_ip(64, &code[off..], t, DecoderOptions::NONE);
+            // The old instruction spanning `t` is junk.
+            if let Some((&k, old)) = by_ip.range(..t).next_back()
+                && k + old.len() as u64 > t
+            {
+                by_ip.remove(&k);
+            }
+            while dec.can_decode() {
+                let i = dec.decode();
+                if i.is_invalid() {
+                    break;
+                }
+                if i.ip() != t && by_ip.contains_key(&i.ip()) {
+                    break; // realigned with the stream already decoded
+                }
+                // Drop old instructions this one overlaps.
+                let stale: Vec<u64> = by_ip
+                    .range(i.ip()..i.ip() + i.len() as u64)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for k in stale {
+                    by_ip.remove(&k);
+                }
+                by_ip.insert(i.ip(), i);
+            }
+        }
     }
-    (out, bad)
+    (by_ip.into_values().collect(), bad)
 }
 
 fn is_cmov_free_load(code: Code) -> bool {
@@ -142,8 +207,19 @@ pub fn find_jump_tables_ext(
         // trap at run time, where an extra one is only a label).
         // Only a compare of the register the table is indexed by bounds it (another register's range check, a few
         // instructions earlier, would cut the table short).
-        let idx = ld.memory_index().full_register();
-        let on_index = |i: &Instruction| i.op0_kind() == OpKind::Register && i.op0_register().full_register() == idx;
+        // (The index may be a copy of the compared register: `mov eax, r13d` after `cmp r13d, N`.)
+        let mut aliases = vec![ld.memory_index().full_register()];
+        for i in win.iter().rev() {
+            use iced_x86::Mnemonic as M;
+            if matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx | M::Movsxd)
+                && i.op0_kind() == OpKind::Register
+                && i.op1_kind() == OpKind::Register
+                && aliases.contains(&i.op0_register().full_register())
+            {
+                aliases.push(i.op1_register().full_register());
+            }
+        }
+        let on_index = |i: &Instruction| i.op0_kind() == OpKind::Register && aliases.contains(&i.op0_register().full_register());
         let pick = (0..win.len()).rev().find(|&k| is_cmp(&win[k]) && on_index(&win[k]) && ja_after(k));
         let bound = pick
             .map(|k| {
@@ -175,6 +251,7 @@ pub fn find_jump_tables_ext(
                 jmp_rva: (j.ip() - base) as u32,
                 table_rva,
                 targets,
+                bounded: bound.is_some(),
             });
         }
     }
