@@ -9,9 +9,10 @@ This is the design for `crates/victory-recomp`, the foundation of the native mac
 | Analysis pass (`victory-recomp analyze <pe>`) | `src/analyze.rs`, `src/image.rs` | Works on the title in about 0.6 s. |
 | Function discovery beyond .pdata | `src/discover.rs` | Works. Adds leaf functions from call targets, relocations and exports. |
 | Lifter, x86-64 to C | `src/lift.rs`, `src/rt.h` | Integer ALU, shifts, rotates, mul/div, `lock`/`xchg`/`cmpxchg` atomics, string ops, `bt*`, BMI1/2, all VEX forms the title uses (xmm and ymm as halves, AVX2, FMA, F16C), loads/stores, push/pop, call/ret/jmp/jcc, jump tables, setcc/cmovcc, bsf/bsr/popcnt, SSE scalar and 128-bit packed float/logic, conversions, compares. |
-| Prototype host | `src/rt_host.c`, `src/harness.h` | Dispatch by RVA over a generated table. A stand-in for the native host. |
+| Runtime | `src/rt_host.c`, `src/rt.h` | Hash dispatch over the generated table, logged pluggable fallback, import thunks with win64 to native argument marshalling, host to guest callbacks, per-thread TEB and stack, Zen 2 CPUID/XGETBV/RDTSC. See "Runtime". |
+| arm64 host (prototype) | `crates/victory-rt` | Loads the lifted dylib into an arm64 process, maps the PE, binds its import table to Rust functions, runs exports. See "Native arm64 host". |
 | Coverage report (`victory-recomp coverage <pe>`) | `src/lib.rs` | Counts functions the lifter accepts. |
-| Tests | `tests/e2e.rs`, `tests/diff.rs`, `tests/diff_vex.rs`, `tests/diff_bits.rs` | See "Test results". |
+| Tests | `tests/e2e.rs`, `diff.rs`, `diff_vex.rs`, `diff_bits.rs`, `diff_legacy.rs`, `kat.rs`, `litmus.rs`; `victory-rt/tests` | See "Test results". |
 
 CLI: `victory-recomp analyze|coverage|lift|flatten|exports`. `lift <pe> <out.c>` writes one C unit for the whole image.
 
@@ -106,7 +107,38 @@ Options:
 2. LDAR/STLR (acquire loads and release stores) on every guest memory access. This gives load-load, load-store and store-store ordering, which is all TSO guarantees (x86 lets a store pass a later load, and so does LDAR/STLR, so it matches). Cost: ARM's acquire/release loads on Apple silicon are cheap relative to a full fence, but they block some addressing modes (no register offset, no pair loads) and stop the compiler merging or reordering accesses. Expect a large slowdown on memory-heavy code (about 22M instructions, 30% of them `mov`). Risk: clang treats `ldar`/`stlr` as atomics, which defeats vectorisation and hoisting.
 3. Plain accesses plus fences only around atomics and at specific points. `lock`-prefixed instructions become `__atomic_*` with seq_cst, and `xchg mem` is implicitly locked. Cost: near zero for ordinary code. Risk: wrong for code that relies on TSO ordering between plain accesses without a `lock` (a spinlock released with a plain `mov`, a Dekker-style publish, `volatile` flags). MSVC's `volatile` on x64 is acquire/release, so plain `mov` carries ordering in the title's own synchronisation primitives.
 
-Decision: build with option 3 as the baseline, because it matches the C11-style code a game uses. Make the memory-access emission a single function in the lifter with a mode switch, so any of the three can be selected per build. Run with option 1 if a way to enable it is found (ask the native-host agent to probe it; the answer changes the plan). Add option 2 only for functions identified as synchronisation code (those that contain `lock`/`xchg`/`pause` or sit in a spin loop, and the functions that call them), not globally. This needs a test: a multi-threaded stress test (message passing and store buffering litmus tests) run lifted versus under Rosetta. That test is not written yet.
+Decision (updated with measurements, see "Litmus results" below): a build without a flag is unchanged (plain accesses, the fastest and the previous behaviour), and the ordered builds are opt-in. The lifter now emits every access that is not provably thread-local through `sld*`/`sst*` (shared), and keeps the plain `ld*`/`st*` for accesses based on `rsp` (the guest stack, including push, pop, call and ret) and for `gs:` (the TEB). The C header decides what the shared names mean, so the same lifted C builds three ways:
+- default: shared accesses are plain. Fastest. Observably wrong for TSO code (below).
+- `-DRT_TSO`: shared loads are acquire (`ldar`/`ldapr`), shared stores are release (`stlr`), misaligned ones take a plain access plus a barrier (LDAR/STLR fault on misaligned addresses, x86 does not), 128-bit accesses get a barrier on one side. This is option 2 restricted to addresses not provably thread-local.
+- `-DRT_TSO_ALL`: every access, stack included. Only for measuring what the thread-local test buys.
+`mfence`/`sfence`/`lfence` are full barriers and `lock`/`xchg` stay seq_cst in every build. Not ordered even under `RT_TSO`: the `rep` string instructions and the masked-move helpers (`h_maskld_*`, `h_maskst_*`), which use plain accesses internally. Rosetta-style hardware TSO is still the better answer if a way to enable it for a native process turns up (not found, not tried privately).
+
+#### Litmus results
+
+`tests/litmus.rs` lifts hand-assembled thread functions (message passing, store buffering with and without `mfence`, load buffering, IRIW, each shared variable on its own 256-byte line, a random 0 to 47 spin before each run) and runs them on 2 or 4 pthreads, against the same bytes executed as x86-64 under Rosetta 2. 5,000,000 iterations per test on an Apple M5 Pro (macOS 27.2.1), numbers are weak outcomes seen:
+
+| Test (weak outcome) | TSO says | x86 under Rosetta | lifted, plain | lifted `RT_TSO` | lifted `RT_TSO_ALL` |
+|---|---|---|---|---|---|
+| MP (reader sees flag, not data) | forbidden | 0 | 6 | 0 | 0 |
+| SB (both loads miss the other store) | allowed | 56 | 229 | 0 | 0 |
+| SB with `mfence` | forbidden | 0 | 0 | 0 | 0 |
+| LB (both loads see the later store) | forbidden | 0 | 0 | 0 | 0 |
+| IRIW (readers disagree on write order) | forbidden | 0 | 0 (1 in an earlier 1M run) | 0 | 0 |
+
+Where ARM differs from x86-TSO: (1) plain loads and stores let MP and IRIW show forbidden outcomes. The 6 in 5M for MP and 1 in 1M for IRIW are rare on Apple cores but real; other cores will show more. (2) Load buffering never appeared in plain mode on this chip, though ARM allows it. (3) Store buffering is allowed by TSO and shows in all but the ordered builds. The ordered builds never show it: ARM's STLR followed by LDAR is sequentially consistent (RCsc), so they are stricter than x86 here. That is safe for correctness and costs a little. The test asserts zero forbidden outcomes for x86 and both TSO builds, and that the TSO build really contains `stlr` and `ldar`/`ldapr` while the plain build contains none. The test takes `LITMUS_ITERS` (default 300,000 so it is cheap).
+
+#### Cost of ordering
+
+Micro-benchmark (`tests/fixtures/bench_driver.c`, best of 5 repetitions, ns per loop iteration, 3 runs agree within 5%):
+
+| Kernel | plain | `RT_TSO` | `RT_TSO_ALL` |
+|---|---|---|---|
+| copy+1 (a shared load and a shared store per element) | 0.126 | 0.301 (2.4x) | 0.300 |
+| stack spill and reload (rsp-based, thread-local) | 0.239 | 0.238 (1.0x) | 0.470 (2.0x) |
+| dependent pointer chase (shared loads) | 0.664 | 0.671 (1.0x) | 0.667 |
+| store stream (shared stores) | 0.223 | 0.226 (1.0x) | 0.228 |
+
+Reading: ordered scalar accesses cost about nothing when memory latency or store bandwidth is the limit (chase, store stream). The 2.4x on the copy loop is mostly clang no longer auto-vectorising it (plain builds turn it into NEON loads and stores; `ldar`/`stlr` are scalar), so it is the worst case for a loop of this shape, not a typical slowdown. The thread-local test is worth it: stack traffic is untouched under `RT_TSO` and doubles under `RT_TSO_ALL`. Recommendation: ship `RT_TSO` for everything and keep an eye on vector-heavy loops; fall back to default plain for functions proven single-threaded if the profile asks for it. Not measured: whole-title speed (not run).
 
 ### SSE, AVX and AVX2 to NEON
 
@@ -144,9 +176,9 @@ HLE functions are host functions behind the title's import slots, and the title 
 
 ### GS-based TEB and TLS
 
-53,055 instructions use a `gs:` prefix (the title reads the TEB: `gs:[0x30]` self pointer, `gs:[0x58]` TLS array pointer, `gs:[0x60]` PEB, `gs:[0x8]`/`[0x10]` stack bounds, thread id, last error). The lifter emits `(u8*)rt_gs + offset`. `rt_gs` is a host-provided per-thread pointer to a TEB-shaped block. Because lifted code runs on ordinary host threads, `rt_gs` must be a thread-local variable (`__thread`), loaded once per function (it is not re-read inside one, so a function must not migrate threads, which holds). The prototype uses a plain global.
+53,055 instructions use a `gs:` prefix (the title reads the TEB: `gs:[0x30]` self pointer, `gs:[0x58]` TLS array pointer, `gs:[0x60]` PEB, `gs:[0x8]`/`[0x10]` stack bounds, thread id, last error). An arm64 process has no free segment register, so the lifter reads `c->gs_base + offset`: the TEB pointer is a field of the `Cpu` struct (`Cpu.gs_base`, last field, never spilled), set once per guest thread by the runtime (`rt_thread_init`) and carried to every callee through the `Cpu *`. `gs:` accesses are classed thread-local for memory ordering. The Rosetta host swaps GS bases on every crossing (about 190 ns each way); here there is nothing to swap. Tested: `guest_teb_self` (`mov rax, gs:[0x30]`) returns the host's TEB pointer and `guest_teb_stack_base` (`gs:[8]`) its stack base, in `victory-rt/tests/native.rs`.
 
-Needed in the TEB block: `ExceptionList` unused on x64, `StackBase`/`StackLimit` (stack probes and stack-size queries), `Self` at `0x30`, `ProcessEnvironmentBlock` at `0x60`, `ThreadLocalStoragePointer` at `0x58` (implicit TLS: `_tls_index` and the per-module TLS array, filled from the image's TLS directory), `LastErrorValue` at `0x68`, and the Xbox-specific fields the title reads. The analysis shows 2 TLS callbacks, which the host runs at thread creation.
+Needed in the TEB block: `StackBase`/`StackLimit` (stack probes and stack-size queries), `Self` at `0x30`, `ProcessEnvironmentBlock` at `0x60`, `ThreadLocalStoragePointer` at `0x58` (implicit TLS: `_tls_index` and the per-module TLS array, filled from the image's TLS directory), `LastErrorValue` at `0x68`, and the Xbox-specific fields the title reads. `native::teb` in the native host already builds exactly this layout. The analysis shows 2 TLS callbacks, which the host runs at thread creation.
 
 ### What I need from the native host's ABI
 
@@ -154,12 +186,63 @@ Needed in the TEB block: `ExceptionList` unused on x64, `StackBase`/`StackLimit`
 2. `IMG`: the image mapped at one base, relocations applied by the host loader (598k DIR64 entries; 529k point into code). The lifter emits `IMG + rva` for rip-relative operands, so the image must keep its section layout. The lifted code does not need the image to be executable (it never executes the bytes) but needs it readable and writable (data, vtables).
 3. IAT fill: each import slot holds an address the dispatcher recognises as an HLE entry. Imports called through `call [rip+slot]` are 5,037 sites.
 4. HLE entry point shape: `void hle(Cpu *c)`, Windows x64 convention as above. Optional typed fast path.
-5. TEB/TLS: a thread-local `rt_gs` per guest thread, with the fields listed; thread start must set up `rsp`, push a return address and call through `rt_dispatch`.
+5. TEB/TLS: `Cpu.gs_base` per guest thread (`rt_thread_init(teb, stack_lo, stack_hi)`), with the fields listed; a callback or thread start goes through `rt_call_guest`, which sets up `rsp`, the return slot and the arguments.
 6. Exceptions: `RtlLookupFunctionEntry`/`RtlVirtualUnwind`/`RtlUnwindEx` as host code over the original `.pdata`; fault handlers translating host signals to guest exceptions; a way to call a landing pad with a given `Cpu`.
 7. Threads and atomics: guest threads are host threads; keep the memory-model choice (TSO mode if any exists) a host decision per thread. Report if the host finds an API for hardware TSO.
 8. A stack with at least 1 MB, 16-byte aligned, 8 bytes below alignment at function entry (as after a `call`) plus 32 bytes of shadow space above it, as `rt_call_win64` does.
 9. The host should log unresolved targets; the recompiler consumes that log as extra function seeds.
 10. Guest address space: guest pointers are host pointers (64-bit). Anything the title stores as an address of its own memory works only if the host allocates at addresses that fit what the title expects (the title uses 64-bit pointers, but may assume high-bit patterns, for example a console memory map). Check this before loading real data.
+
+## Runtime
+
+`src/rt_host.c` (declared in `src/rt.h`) is the contract between lifted code and a host. It is C, compiled into the same dylib or static library as the lifted units, so a lifted call into it is an ordinary call. The Rust host (`crates/victory-rt`) reaches it through `dlsym`.
+
+- **Dispatch.** `rt_dispatch(Cpu*, target)` is what every indirect call and tail jump uses. `rt_init(img, size)` builds an open-addressing hash (multiplicative, load factor under 0.5) over the generated `rt_table`; a lookup is one or two probes, where the sorted table would need 19 compares for the title's 404k functions (the binary search is still the path before `rt_init`). The order of resolution: inside the image and a function start, then lifted code; inside the import area, then an import; anything else is `rt_unresolved`.
+- **Unresolved targets.** `rt_unresolved` logs each distinct address once to stderr ("inside the image, not a lifted function start" or "outside the image", with the RVA), keeps a count (`rt_unresolved_count`), and hands the call to the pluggable `rt_set_fallback` handler, which must behave like the callee (set `rax`, `rsp += 8`). With no handler it aborts. The log is the discovery feed for extra function seeds, as before; the handler is where an interpreter or a JIT helper plugs in.
+- **Imports (IAT).** `rt_import_bind(RtImport*)` returns a thunk address (16 bytes apart, in a static area nobody executes) to write into the IAT slot. A lifted `call [rip+slot]` pushes the return address and lands in `rt_dispatch` with that value. The import entry either takes the `Cpu` (`raw`), or is a native function with a signature: argument `i` comes from `rcx, rdx, r8, r9` for `i < 4` (or `xmm0..3` by position for a double or float), else from the stack at `rsp + 8 + 8*i` (the return address, then 32 bytes of shadow space); integers go to `x0..x7` and floating-point to `d0..d7` in order, which is what AAPCS64 does for a function that mixes the two (a function with fewer parameters ignores the rest). Results: 64-bit integer, 32-bit integer (zero-extended into `rax`, since AAPCS64 leaves the upper half undefined), double or float into `xmm0`, or none. Then the import's `ret`: `rsp += 8`. No GS swap, no register save beyond what the lifted caller already did: the `Cpu` holds the callee-saved registers, and the Win64 volatile ones are free to be clobbered. Limits: 8 integer and 8 floating-point arguments; more is a trap.
+- **Callbacks (host to guest).** `rt_call_guest(target, args, n, fmask, &xmm0)` builds a fresh `Cpu` from Windows x64 arguments (bit `i` of `fmask`: argument `i` is a double passed as bits), pushes a return slot, copies the stack arguments, dispatches, and returns `rax` and `xmm0`. It runs below the innermost lifted frame when called from an import (`rt_cur`, set by the import entry), else on the thread's guest stack, so callbacks nest to any depth. Used for window procedures, thread start routines, completion callbacks and `XMemAlloc` hooks. The Rust side is `victory_rt::call_guest`.
+- **Threads.** `rt_thread_init(teb, stack_lo, stack_hi)` sets the thread's TEB and guest stack (thread-local). A thread that never calls it gets a zeroed TEB with self pointer and stack bounds, and a 1 MiB stack on first use.
+- **CPUID, XGETBV, RDTSC.** Answer like the console's CPU, a custom Zen 2 (8 cores, 16 threads). `victory-hle` has no CPUID answer of its own (`IsProcessorFeaturePresent` in `host_posix/system.rs` returns true for SSE, RDTSC, SSE2, NX, SSE3, CX16, XSAVE, RDRAND, SSSE3, SSE4.1 and SSE4.2, and on Wine/Windows the title sees the real CPU), so these follow the Zen 2 retail part: leaf 0 `AuthenticAMD`, max leaf 0x10; leaf 1 family 17h model 71h, 16 logical processors, ecx = SSE3, PCLMULQDQ, MONITOR, SSSE3, FMA, CMPXCHG16B, SSE4.1/4.2, MOVBE, POPCNT, AES, XSAVE, OSXSAVE, AVX, F16C, RDRAND and no hypervisor bit; leaf 7 ebx = FSGSBASE, BMI1, AVX2, SMEP, BMI2, INVPCID, RDSEED, ADX, SMAP, CLFLUSHOPT, CLWB, SHA and no AVX-512; leaf 0xD for x87+SSE+AVX state; extended leaf 0x80000001 with LZCNT and SSE4a (the title uses `insertq`); brand string leaves; invariant TSC. `XGETBV(0)` is 7. `RDTSC` is `CLOCK_UPTIME_RAW` in nanoseconds (1 GHz), the same rate the HLE reports for the performance counter. All of this is a model of the console, not data read from one: the title's own feature checks are the only consumer. One mismatch to fix in the HLE: its `IsProcessorFeaturePresent` list omits `PF_AVX_INSTRUCTIONS_AVAILABLE` (39) and `PF_AVX2_INSTRUCTIONS_AVAILABLE` (40), although its comment says AVX2 is present.
+
+Tested in `victory-rt/tests/native.rs`: argument marshalling with a mix of integers, doubles, a float and stack arguments (`host_mix`, `host_sum8`), a host to guest callback that passes a double, `gs:` reads, `cpuid`/`xgetbv`/`rdtsc` executed by lifted code against the runtime's tables and the Zen 2 bits above, and the fallback with both kinds of unresolved address.
+
+## Native arm64 host
+
+### Process
+
+The recompiled title runs in an arm64 macOS process. The lifted units and `rt_host.c` are built into one dylib (or a static library linked into the host); the host (Rust) maps the PE image at the address the lifted code gets as `IMG`, applies the `DIR64` relocations, writes an import thunk into every IAT slot and enters guest code through `rt_call_guest`. The lifted code needs the image readable and writable, not executable. Guest addresses are host addresses, so the title's pointers go to HLE functions unchanged. The native host's `NativeImage::map` already does this in an arch-neutral way (maps at the preferred base, 16 KiB aligned, relocates); the arm64 host binary must stay out of `0x1_4000_0000` and up if the title needs its preferred base. The prototype maps anywhere and relocates.
+
+### What assumes x86-64 today
+
+Findings from the `native/join-2` tree, checked by building `victory-loader` and `victory-hle` for `aarch64-apple-darwin` in a scratch copy (nothing in that worktree was edited): `victory-loader` builds, because everything x86-specific in `native` is behind `cfg(target_arch = "x86_64")`; `victory-hle` does not: widening its `all(macos, x86_64)` gates to `macos` produces 121 errors, 98 of them `"win64" is not a supported ABI` and the other 23 references to the x86-only modules (`call_win64`, `declare_win64`, `declare_direct`, `expose_object`, `host_callbacks`, `is_title_code`, `native::teb`, `native::threadctl`, `native::seh::api`, `spawn_title_thread_with`, `disable_thread_calls`). Unmodified, the only error is `modules/dstorage.rs:197`, which uses `host_posix` outside the gate.
+
+| Assumption | Where | Equivalent for lifted code on arm64 |
+|---|---|---|
+| GS-swapping bridge: `victory_bridge_to_host`, `victory_bridge_win64`, `victory_call_win64` in `global_asm!`, the `thread_fast_set_cthread_self` machdep call (0x3000003) at every crossing, a 32-byte stub per import | `native/bridge.rs` (599 lines) | None needed. An import is `rt_import_bind` plus a signature, a callback is `rt_call_guest`. No second GS base, so no swap (about 190 ns each way removed). |
+| `extern "win64"` host functions for float arguments (math 55, xaudio2 46, ucrt 2, victory-gpu 2, loader 5) | `victory-hle`, `victory-gpu`, `victory-loader` | `extern "win64"` does not exist on aarch64. These become `extern "C"` with a signature string (`"idd>d"`), which is the `sig` field `native-host.md` already proposes for `HleExport`. |
+| TEB at `gs:`, the host's own TSD at `gs:` too (`OFF_HOST_TSD`, slots 11 and 12 collide with libSystem keys) | `native/teb.rs`, asm reads `gs:[0x30]` | `Cpu.gs_base`. `ThreadTeb::new` and `register_tls` are arch-neutral already; `host_tsd_base` goes away. |
+| Entering and leaving title code, thread start, DLL thread notices | `native/run.rs`, `threadctl.rs` | `rt_thread_init` then `rt_call_guest(start, [arg])` on a host thread; a guest thread is a host thread. |
+| Vtable bridging: `expose_object` replaces an HLE object's method table word with a bridged copy, `is_title_code` tests for a mapped image | `native/bridge.rs` | The copy's slots become `rt_import_bind` thunks (same table, different slot values); `is_title_code` is the range test `rt_dispatch` already does. Calling a slot from lifted code is an indirect call, which already works. |
+| SEH: `signal.rs` reads `rip`/`rsp` out of an x86-64 `ucontext`, `dispatch.rs` has asm that runs handlers and resumes with an x64 register file, a Windows `CONTEXT` is the x64 one | `native/seh/` | See "Exceptions". |
+| `std::arch::x86_64::__cpuid` for the CPU name | `crash.rs` | `rt_cpuid` (the lifted code asks the runtime, not the CPU). |
+| Rosetta patching of stores it cannot resume (`vpmaskmov`, `vcvtps2ph` to memory) | `masked.rs` (Windows only) | Not needed: the lifted masked store touches only enabled lanes. |
+| Page size: 16 KiB native, 4 KiB reported under Rosetta | image mapping | The mapping code already aligns to 16 KiB. |
+| x86-64 memory model | everything | `RT_TSO` build flag, see "Memory ordering". |
+
+### Exceptions: SEH and C++ over `.pdata` with lifted frames
+
+Only 596 of the title's 298,742 non-chained `.pdata` functions (0.2%) carry an exception or termination handler (`UNW_FLAG_EHANDLER` 499, `UHANDLER` 593), so the cost of supporting handlers can sit entirely in those functions.
+- **Context.** A Windows `CONTEXT` is the guest register file. `RaiseException` and the other raising paths are imports, so the `Cpu` the import entry receives is exact (lifted code spills at every call), and the host fills a `CONTEXT` from it. The unwinder in `native/seh/unwind.rs` (`.pdata` lookup, `UNWIND_INFO` replay, `RtlVirtualUnwind`) reads guest memory and a `CONTEXT`, so it is reused as is. It works because the lifted code keeps a faithful guest stack with real return addresses (`IMG + rva` of the original call site).
+- **Dispatch.** The first pass walks frames and calls each language handler (`__C_specific_handler`, `__CxxFrameHandler*`, which live in the title's own runtime and are lifted) with `rt_call_guest(handler, [record, frame, context, dispatcher_context])`. The second pass does the same for unwinding.
+- **Landing pads.** Catch and `__except` targets, and `__finally` funclets, are entry points. Funclets have `.pdata` entries (chained or their own), so they already are lifted functions. The address a catch funclet returns to (a label in the parent function) is not a function start, so the lifter emits, for every such address found in `C_SCOPE_TABLE.JumpTarget` and in `lea rax,[rip+L]; ret` funclet tails, a secondary entry: the parent body is generated once as a function taking an entry index, with a `switch` to the label at the top, and `f_<rva>_at_<label>(Cpu*)` calls it. Registers come from the unwound `Cpu`, so nothing else is needed to resume mid-function. Not written.
+- **Dropping the frames between.** The C frames of the lifted functions between the raise and the catching frame must leave the host stack. The 596 handler-bearing functions register a frame record (guest `rsp`, a `jmp_buf`) with `_setjmp` at entry and pop it at exit; the unwinder, after choosing the target frame, `longjmp`s to its record and the function re-enters at the landing pad's entry index. Lifted functions with no handler hold no state that needs cleanup (their locals are registers, spilled at calls), so skipping them is safe. Not written.
+- **Hardware faults.** `SIGSEGV`/`SIGBUS`/`SIGFPE` arrive with a host PC. `native/seh/signal.rs` is x86-64 (`ucontext` layout) and moves to the arm64 `__darwin_arm_thread_state64`. The host PC maps to a guest function through a table from the lifter (function granularity), and the register file is the last spill, so exact state at a fault is only guaranteed at function granularity; the lifter decorates `div` and guard-page-sensitive accesses where a precise state matters (see "SEH and unwinding" above). A fault inside the runtime (an HLE function) is the host's, as today.
+
+### Prototype and what runs
+
+`crates/victory-rt` is the minimal host: `Host::load(dylib, pe, imports)` does the steps above, with the imports as Rust `extern "C"` functions plus a signature string, and `Host::call`/`call_ex` run exports. `tests/native.rs` builds `tests/fixtures/hostprobe.c` into a Windows DLL with a real import table (`host.dll`, an import library made from `host.def`), lifts it, builds lifted code and runtime into `libtitle.dylib`, loads that into the arm64 test process, binds five imports to Rust functions, and checks results, marshalling, the callback, `gs:`, CPUID and the fallback. `tests/testpe.rs` runs the recompiler's existing end-to-end PE (`tests/fixtures/testpe.c`, 18 exports: integer, double, pointer, switch, recursion) natively through the same host. Both run in an arm64 process: no Rosetta, no GS, no bridge. Not done: the title (not run here), the real `NativeImage`, `victory-hle` and `victory-gpu` on aarch64 (see the table above), exceptions, threads beyond the calling thread, TLS directory and callbacks, and anything GPU or audio.
+
+Order of work for the real host: (1) make `victory-hle` build for aarch64 (`extern "win64"` to `extern "C"` plus signatures, the dstorage gate), (2) a `current_teb()` behind both hosts and `ThreadTeb` arch-neutral, (3) bind imports through `rt_import_bind` using the HLE registry's signatures, (4) thread start and TLS callbacks over `rt_call_guest`, (5) SEH as above, (6) fault signals.
 
 ## Test results
 
@@ -179,6 +262,15 @@ Not tested: `adcx`/`adox` (Rosetta 2 raises SIGILL on ADX), `vcvtps2ph` rounding
 - `tests/diff_bits.rs`, 4 tests, 261 snippets: `lock_xchg_cmpxchg_match_x86` (78, including `cmpxchg16b`), `bit_tests_match_x86` (66, with bit-string addressing and `lock bts/btr/btc`), `bmi_match_x86` (64), `string_flags_and_misc_match_x86` (53: `rep movs/stos/lods`, `repe cmps`, `repne scas`, `pushfq/popfq/lahf/sahf`, `shld/shrd`, 8/16-bit `div`, `cwd`).
 
 Where Rosetta 2 and the Intel manual disagree the lifter follows the manual and the test masks the flag: `vptest`/`vtestps`/`vtestpd` leave PF=1 under Rosetta (SDM: cleared), `cmpxchg` flags are computed as dest minus accumulator by Rosetta and accumulator minus dest by the lifter (QEMU's model), and `vpsllvq`/`vpsrlvq` truncate the count to 32 bits under Rosetta. Two lifter facts the tests pinned down: a 32-bit `cmpxchg` always writes `eax` (zero-extending `rax`) even when it succeeds, and `rcpps`/`rsqrtps` return Intel's 12-bit table values, reproduced bit for bit by a formula (midpoint of the 11/10-bit mantissa index, rounded on a 2^-13 grid) instead of a table.
+
+### Added in stage 4
+
+- `tests/diff_legacy.rs`, 2 tests, 501 snippets (465 and 36) against Rosetta 2: every legacy SSE integer form (add/sub/saturating, multiplies, min/max, compares, sign, horizontal adds, packs, unpacks, `pshufb`/`pshufd`/`pshufhw`/`pshuflw`, `palignr`, blends, all shifts and byte shifts, `pmovsx`/`pmovzx`, `cvtdq2pd`, `pinsr*`/`pextr*`, `pmovmskb`/`movmskps`/`movmskpd`, `haddps` family, `movlhps`/`movhlps`), `phminposuw`/`vphminposuw`, and AES-NI/`pclmulqdq` in legacy and VEX 128-bit forms (including `aeskeygenassist`, `aesimc`). The result ymm is stored whole, so a legacy form that touched the upper half would fail.
+- `tests/kat.rs`, 5 tests (Rosetta 2 raises SIGILL on these, so only the lifted build runs): AES-128 key schedule with `aeskeygenassist`, encryption and `aesimc` decryption against the FIPS-197 C.1 vector, legacy and VEX encodings, 300 times each; the VAES and VPCLMULQDQ ymm forms equal the (diff-tested) xmm forms on each half; `pclmulqdq` for the four immediates against a bitwise carry-less multiply in Rust; SSE4a `insertq` and `extrq`, immediate and register forms, seven (length, index) shapes; `adcx` and `adox` 32 and 64 bit with carry in 0 and 1.
+- `tests/litmus.rs`: the litmus and cost results above.
+- `crates/victory-rt/tests/native.rs` and `testpe.rs`: the arm64 host runs (see "Native arm64 host").
+
+Lifter coverage of the title after this stage: 403,947 of 403,953 functions lift. The six left are decode failures (the decoder, not the lifter); the 54 functions that were stubbed for AES-NI, `pclmulqdq`, legacy SSE, `insertq`, `vphminposuw`, `int`, `enter`, `hlt`, `monitorx`/`mwaitx` and `clzero` now lift (`int`, `hlt` as `rt_trap`; `monitorx`/`mwaitx` as no-ops; `enter` with nesting). Compile check: the four units that hold the new instructions (`tu_00006`, `tu_00018`, `tu_00036`, `tu_00099`; the whole split build was not redone) compile with the recommended line. The title's AES/CLMUL code is 4 + 4 + 4 functions; their results are covered by the KATs above, not by running the title.
 
 ### Design choices made in this stage
 
@@ -203,15 +295,16 @@ Recommendation: keep C for now. Compile cost is workable (25 minutes on a develo
 
 ## Next steps, in order
 
-Done in this stage: VEX 128/256-bit, FMA, F16C and AVX2 integer ops, atomics and prefixes, bit ops, BMI, flag moves, chained `.pdata` merge, `jmp reg` fallback, split build and measurement.
+Done in stage 3: VEX 128/256-bit, FMA, F16C and AVX2 integer ops, atomics and prefixes, bit ops, BMI, flag moves, chained `.pdata` merge, `jmp reg` fallback, split build and measurement.
+Done in stage 4: the runtime (dispatch, imports, callbacks, CPUID), an arm64 host prototype on the test PEs, litmus tests and the `RT_TSO` flag with its cost, the remaining stubbed instructions.
 
-1. Hook up the native host: real `rt_dispatch` and HLE table, loader with relocations, `rt_gs` TEB, IAT fill, `rt_cpuid`/`rt_xgetbv`/`rt_rdtsc`. Run the first lifted title function end to end.
-2. Watch the unresolved-target log for the 5,868 functions that hold an untabled `jmp reg`; recover the real switch shapes (`Add Imul ...`, `Mov Lea ...`) and feed them back.
-3. Memory model: ask the host agent to probe for hardware TSO on native macOS; write the litmus tests (message passing, store buffering) lifted versus Rosetta; option 2 for synchronisation functions.
-4. The remaining 54 stubbed functions: AES-NI, `pclmulqdq` (ARM crypto extensions), legacy SSE integer forms, `vphminposuw`.
-5. Exceptions: host `RtlVirtualUnwind` over `.pdata`, landing-pad entry points, fault signal mapping.
-6. Interpreter fallback for unresolved targets, so partial lifts run.
-7. Differential testing against Rosetta on whole real functions, once the title's code is allowed on this machine (outside the repo).
-8. Build: adopt `-mllvm -disable-machine-sink`, run the full build in CI-like scripts, measure runtime speed, then decide on an IR back-end for hot functions.
+1. Make `victory-hle` and the loader's `native` module build and run on aarch64 (table in "Native arm64 host"), then run the first lifted function of the title in an arm64 process through `NativeImage::map`, `rt_import_bind` and the HLE registry's signatures.
+2. Exceptions: landing-pad entries, handler frame records and `longjmp` unwinding, `RtlVirtualUnwind` over `.pdata`, fault signals on arm64 (design above, none of it written).
+3. Watch the unresolved-target log for the 5,868 functions that hold an untabled `jmp reg`; recover the real switch shapes (`Add Imul ...`, `Mov Lea ...`) and feed them back.
+4. Memory ordering: decide the default build (`RT_TSO`, measured above), run the litmus tests on the other Macs, and try per-function plain builds for provably single-threaded code if the whole-title profile shows the cost. Probe once for a way to enable hardware TSO in a native process.
+5. Interpreter fallback behind `rt_set_fallback`, so partial lifts and a missed function run.
+6. Differential testing against Rosetta on whole real functions, once the title's code is allowed on this machine (outside the repo).
+7. Build: adopt `-mllvm -disable-machine-sink` (and `-mcpu=apple-m1` or `-march=armv8.4-a+aes` so the crypto helpers inline), run the full build in CI-like scripts, measure run-time speed, then decide on an IR back-end for hot functions. The decode failures (6 functions) need the decoder looked at.
+8. A per-site inline cache or direct call table for the hot indirect calls, if profiling shows the hash lookup matters.
 
 Sources for the TSO notes: [Apple silicon TSO study (ASPLOS 2026)](https://www.cs.tau.ac.il/~mad/publications/asplos2026-TSO.pdf) and [the 2024 arm64 TSO prctl thread](https://lists.infradead.org/pipermail/linux-arm-kernel/2024-May/926327.html). Neither says whether macOS lets a native process enable it.
