@@ -22,6 +22,7 @@ victory-platform.workspace = true
 # The arm64 host runs the recompiled title through the runtime.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 victory-rt.workspace = true
+anyhow.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

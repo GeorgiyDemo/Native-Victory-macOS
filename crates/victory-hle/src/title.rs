@@ -205,6 +205,98 @@ pub mod arm64 {
         (found, missing)
     }
 
+    /// What an unbound import's thunk does, per `dll!symbol`: the policy and a call count.
+    static UNSERVED: Mutex<Option<HashMap<String, (victory_loader::UnimplementedPolicy, u64)>>> =
+        Mutex::new(None);
+
+    /// The `Raw` handler behind every unserved import: it asks the runtime which import it is in.
+    unsafe extern "C" fn unserved(cpu: *mut victory_rt::Cpu) {
+        let name = victory_rt::current_import().unwrap_or_default();
+        let (policy, calls) = {
+            let mut sites = lock(&UNSERVED);
+            let site = sites
+                .get_or_insert_default()
+                .entry(name.clone())
+                .or_insert((victory_loader::UnimplementedPolicy::ReturnZero, 0));
+            site.1 += 1;
+            *site
+        };
+        match policy {
+            victory_loader::UnimplementedPolicy::ReturnZero => {
+                if calls == 1 {
+                    tracing::warn!(import = %name, "unimplemented import called, returning 0");
+                }
+                // SAFETY: the Cpu of the call, handed to us by the runtime.
+                unsafe { (*cpu).r[victory_rt::reg::RAX] = 0 };
+            }
+            victory_loader::UnimplementedPolicy::Trap => {
+                eprintln!("VIctory: unimplemented import {name} called");
+                std::process::abort();
+            }
+        }
+    }
+
+    /// Fills every IAT slot of `image` (delay-load slots too), as the Rosetta host's `bind_imports` does:
+    /// what `resolver` serves gets the runtime's thunk for it (our functions, by their signatures; a title
+    /// DLL's export is the lifted function's own address), and what it cannot, by name or by ordinal, a
+    /// thunk that logs and acts on `policy` (`ReturnZero`: `rax = 0`; `Trap`: abort). Needs the runtime
+    /// loaded and the image attached (`victory_rt::open`, `attach_image`).
+    pub fn bind_imports(
+        image: &victory_loader::native::NativeImage,
+        resolver: &dyn victory_loader::ImportResolver,
+        policy: victory_loader::UnimplementedPolicy,
+    ) -> anyhow::Result<victory_loader::BindReport> {
+        use victory_loader::{MissingImport, Provenance, Resolution};
+        let info = image.info();
+        let mut report = victory_loader::BindReport::default();
+        let mut slots = Vec::with_capacity(info.import_count());
+        for module in info.imports.iter().chain(&info.delay_imports) {
+            for entry in &module.entries {
+                let address = match resolver.resolve(&module.dll, &entry.symbol) {
+                    Resolution::Found {
+                        address,
+                        provenance: Provenance::Title,
+                    } => {
+                        report.title += 1;
+                        address
+                    }
+                    Resolution::Found {
+                        address,
+                        provenance,
+                    } => {
+                        match provenance {
+                            Provenance::Hle => report.hle += 1,
+                            _ => report.host += 1,
+                        }
+                        stub_for(address).ok_or_else(|| {
+                            anyhow::anyhow!("no thunk for {}!{}", module.dll, entry.symbol)
+                        })?
+                    }
+                    Resolution::Missing => {
+                        let name = format!("{}!{}", module.dll, entry.symbol);
+                        lock(&UNSERVED)
+                            .get_or_insert_default()
+                            .insert(name.clone(), (policy, 0));
+                        report.missing.push(MissingImport {
+                            dll: module.dll.clone(),
+                            symbol: entry.symbol.to_string(),
+                        });
+                        victory_rt::import_thunk(&name, victory_rt::Binding::Raw(unserved))? as usize
+                    }
+                };
+                slots.push((entry.iat_slot_rva, address));
+            }
+        }
+        image.write_slots(&slots)?;
+        tracing::info!(
+            hle = report.hle,
+            host = report.host,
+            missing = report.missing.len(),
+            "native imports bound"
+        );
+        Ok(report)
+    }
+
     /// Entry points for host functions the title calls through pointers it was handed (the methods of a
     /// COM object), one per target in the same order. Same thunks as everywhere else.
     pub fn host_callbacks(targets: &[(usize, bool)]) -> std::io::Result<Vec<usize>> {

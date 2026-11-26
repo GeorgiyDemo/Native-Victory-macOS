@@ -18,3 +18,4 @@ workspace = true
 [dev-dependencies]
 victory-hle.workspace = true
 victory-loader.workspace = true
+victory-platform.workspace = true

@@ -849,6 +849,7 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "miniz_oxide",
  "opus-pure",
  "tempfile",
@@ -935,6 +936,7 @@ dependencies = [
  "victory-hle",
  "victory-loader",
  "victory-pe",
+ "victory-platform",
  "victory-recomp",
 ]
 

@@ -56,6 +56,8 @@ typedef struct {
 } RtImport;
 u64 rt_import_bind(const RtImport *imp);
 const char *rt_import_name(u64 thunk);
+/* The name of the import this thread's lifted code is inside (for a raw handler shared by several), or null. */
+const char *rt_current_import(void);
 
 /* Callbacks (host to guest). Sets up a Cpu from Windows x64 arguments (bit i of fmask: argument i is a double,
  * given as its bit pattern), runs the guest function at `target` on the thread's guest stack (below the

@@ -111,7 +111,11 @@ struct Rt {
     unresolved_count: UnresolvedCount,
     cpuid: Cpuid,
     bind: Bind,
+    init: Init,
+    cur_import: CurImport,
 }
+type Init = unsafe extern "C" fn(*mut u8, u64);
+type CurImport = unsafe extern "C" fn() -> *const c_char;
 type Bind = unsafe extern "C" fn(*const RtImport) -> u64;
 type CallGuest = unsafe extern "C" fn(u64, *const u64, u32, u32, *mut u64) -> u64;
 type ThreadInit = unsafe extern "C" fn(*mut u8, *mut u8, *mut u8);
@@ -190,52 +194,79 @@ pub struct Host {
     pub teb: *mut u8,
 }
 
+/// Loads `dylib` (lifted units and runtime, built by the caller) into the process and finds the runtime's
+/// entry points. Once per process; the image is attached separately ([`attach_image`]).
+pub fn open(dylib: &Path) -> Result<()> {
+    let path = CString::new(dylib.to_str().context("dylib path")?)?;
+    // SAFETY: plain dlopen of a library we just built.
+    let lib = unsafe { dlopen(path.as_ptr(), 2) };
+    if lib.is_null() {
+        // SAFETY: dlerror returns a NUL-terminated string after a failed dlopen.
+        let e = unsafe { std::ffi::CStr::from_ptr(dlerror()) };
+        bail!("dlopen {}: {}", dylib.display(), e.to_string_lossy());
+    }
+    // SAFETY (for every use): each symbol is declared with exactly this signature in rt.h, and a function
+    // pointer is the size of the `*mut c_void` dlsym returns.
+    let sym = |n: &str| -> Result<*mut c_void> {
+        let c = CString::new(n)?;
+        // SAFETY: lib is a live handle.
+        let p = unsafe { dlsym(lib, c.as_ptr()) };
+        if p.is_null() {
+            bail!("{n} not found in {}", dylib.display());
+        }
+        Ok(p)
+    };
+    // SAFETY: see above.
+    let rt = unsafe {
+        Rt {
+            call_guest: std::mem::transmute::<*mut c_void, CallGuest>(sym("rt_call_guest")?),
+            thread_init: std::mem::transmute::<*mut c_void, ThreadInit>(sym("rt_thread_init")?),
+            set_fallback: std::mem::transmute::<*mut c_void, SetFallback>(sym("rt_set_fallback")?),
+            unresolved_count: std::mem::transmute::<*mut c_void, UnresolvedCount>(sym(
+                "rt_unresolved_count",
+            )?),
+            cpuid: std::mem::transmute::<*mut c_void, Cpuid>(sym("rt_cpuid")?),
+            bind: std::mem::transmute::<*mut c_void, Bind>(sym("rt_import_bind")?),
+            init: std::mem::transmute::<*mut c_void, Init>(sym("rt_init")?),
+            cur_import: std::mem::transmute::<*mut c_void, CurImport>(sym("rt_current_import")?),
+        }
+    };
+    if RT.set(rt).is_err() {
+        bail!("a host is already loaded in this process");
+    }
+    Ok(())
+}
+
+/// Tells the runtime where the image is (`base`, `len` bytes, relocations applied: what
+/// `NativeImage::map` leaves) and builds its dispatch table. After it, guest calls and import thunks work.
+///
+/// # Safety
+/// `base..base+len` is the mapped image the lifted code was made from, and stays mapped.
+pub unsafe fn attach_image(base: *mut u8, len: usize) -> Result<()> {
+    let rt = RT.get().context("no host loaded")?;
+    // SAFETY: forwarded.
+    unsafe { (rt.init)(base, len as u64) };
+    IMAGE.store(base as usize, Ordering::Release);
+    IMAGE_END.store(base as usize + len, Ordering::Release);
+    Ok(())
+}
+
+/// Name of the import the calling thread's lifted code is inside (the runtime's `rt_current_import`), for a
+/// `Binding::Raw` function shared by several imports. `None` outside an import.
+pub fn current_import() -> Option<String> {
+    let rt = RT.get()?;
+    // SAFETY: returns a NUL-terminated name owned by the runtime, or null.
+    let p = unsafe { (rt.cur_import)() };
+    // SAFETY: as above.
+    (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned())
+}
+
 impl Host {
     /// Loads `dylib` (lifted units and runtime, built by the caller), maps `pe` into it and binds `imports`.
     /// Fails if the image imports something not in `imports`.
     pub fn load(dylib: &Path, pe: &[u8], imports: &[Import]) -> Result<Host> {
-        let path = CString::new(dylib.to_str().context("dylib path")?)?;
-        // SAFETY: plain dlopen of a library we just built.
-        let lib = unsafe { dlopen(path.as_ptr(), 2) };
-        if lib.is_null() {
-            // SAFETY: dlerror returns a NUL-terminated string after a failed dlopen.
-            let e = unsafe { std::ffi::CStr::from_ptr(dlerror()) };
-            bail!("dlopen {}: {}", dylib.display(), e.to_string_lossy());
-        }
-        // SAFETY (for every use): each symbol is declared with exactly this signature in rt.h, and a function
-        // pointer is the size of the `*mut c_void` dlsym returns.
-        let sym = |n: &str| -> Result<*mut c_void> {
-            let c = CString::new(n)?;
-            // SAFETY: lib is a live handle.
-            let p = unsafe { dlsym(lib, c.as_ptr()) };
-            if p.is_null() {
-                bail!("{n} not found in {}", dylib.display());
-            }
-            Ok(p)
-        };
-        // SAFETY: see above.
-        let rt = unsafe {
-            Rt {
-                call_guest: std::mem::transmute::<*mut c_void, CallGuest>(sym("rt_call_guest")?),
-                thread_init: std::mem::transmute::<*mut c_void, ThreadInit>(sym("rt_thread_init")?),
-                set_fallback: std::mem::transmute::<*mut c_void, SetFallback>(sym(
-                    "rt_set_fallback",
-                )?),
-                unresolved_count: std::mem::transmute::<*mut c_void, UnresolvedCount>(sym(
-                    "rt_unresolved_count",
-                )?),
-                cpuid: std::mem::transmute::<*mut c_void, Cpuid>(sym("rt_cpuid")?),
-                bind: std::mem::transmute::<*mut c_void, Bind>(sym("rt_import_bind")?),
-            }
-        };
-        // SAFETY: see above.
-        let init = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut u8, u64)>(sym("rt_init")?)
-        };
-        if RT.set(rt).is_err() {
-            bail!("a host is already loaded in this process");
-        }
-
+        open(dylib)?;
+        let rt = *RT.get().expect("just opened");
         // Map the image: sections at their RVAs, then base relocations.
         let image = Image::parse(pe)?;
         let size = (image.info.size_of_image as usize).next_multiple_of(0x4000);
@@ -262,9 +293,7 @@ impl Host {
             }
         }
         // SAFETY: img/size describe the mapping just made.
-        unsafe { init(img, size as u64) };
-        IMAGE.store(img as usize, Ordering::Release);
-        IMAGE_END.store(img as usize + size, Ordering::Release);
+        unsafe { attach_image(img, size)? };
 
         // Imports: one runtime thunk per host function, written into the IAT slots.
         let by_name: HashMap<&str, &Import> = imports.iter().map(|i| (i.name, i)).collect();

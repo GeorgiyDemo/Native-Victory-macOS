@@ -48,10 +48,11 @@ static inline RtFn lookup(u32 rva) {
 }
 
 /* ---- imports ---- */
-#define MAX_IMPORTS 4096
+#define MAX_IMPORTS 16384
 static _Alignas(16) u8 imp_area[MAX_IMPORTS * 16];
 static RtImport imps[MAX_IMPORTS];
 static unsigned n_imps;
+static __thread const RtImport *rt_cur_imp; /* the import this thread is inside */
 static __thread Cpu *rt_cur; /* innermost Cpu of this thread's lifted code that entered the host */
 
 u64 rt_import_bind(const RtImport *m) {
@@ -61,6 +62,7 @@ u64 rt_import_bind(const RtImport *m) {
   imps[i].name = strdup(m->name ? m->name : "?");
   return (u64)(imp_area + (size_t)i * 16);
 }
+const char *rt_current_import(void) { return rt_cur_imp ? rt_cur_imp->name : 0; }
 const char *rt_import_name(u64 t) {
   return t >= (u64)imp_area && t < (u64)(imp_area + sizeof imp_area) ? imps[(t - (u64)imp_area) / 16].name : 0;
 }
@@ -71,7 +73,9 @@ typedef float (*FnF)(u64, u64, u64, u64, u64, u64, u64, u64, double, double, dou
 
 static void import_call(Cpu *c, const RtImport *m) {
   Cpu *saved = rt_cur;
+  const RtImport *saved_imp = rt_cur_imp;
   rt_cur = c;
+  rt_cur_imp = m;
   if (m->raw) {
     m->raw(c);
   } else {
@@ -95,6 +99,7 @@ static void import_call(Cpu *c, const RtImport *m) {
     }
   }
   rt_cur = saved;
+  rt_cur_imp = saved_imp;
   c->r[4] += 8; /* the import's `ret`: pop the return address the call pushed */
 }
 
