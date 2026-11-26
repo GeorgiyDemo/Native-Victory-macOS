@@ -189,14 +189,14 @@ impl L<'_> {
             | M::Vunpcklpd | M::Vunpckhpd | M::Vpunpcklbw | M::Vpunpckhbw | M::Vpunpcklwd
             | M::Vpunpckhwd | M::Vpunpckldq | M::Vpunpckhdq | M::Vpunpcklqdq | M::Vpunpckhqdq
             | M::Vpshufb | M::Vpsllvd | M::Vpsrlvd | M::Vpsravd | M::Vpsllvq | M::Vpsrlvq
-            | M::Vmovlhps | M::Vmovhlps
+            | M::Vmovlhps | M::Vmovhlps | M::Vaesenc | M::Vaesenclast | M::Vaesdec | M::Vaesdeclast
                 if i.op_count() == 3 && i.op_kind(1) == OpKind::Register =>
             {
                 self.lane(i, &hn, &[1, 2], &[], None)?
             }
             // ---- three operands plus an immediate ----
             M::Vshufps | M::Vpalignr | M::Vcmpps | M::Vcmppd | M::Vpblendw | M::Vblendps
-            | M::Vpblendd | M::Vblendpd | M::Vshufpd => {
+            | M::Vpblendd | M::Vblendpd | M::Vshufpd | M::Vpclmulqdq => {
                 let v = imm();
                 let (helper, lo, hi) = match m {
                     M::Vblendps | M::Vpblendd => ("h_vblendps".to_string(), v & 15, v >> 4),
@@ -209,12 +209,12 @@ impl L<'_> {
             // ---- one source ----
             M::Vsqrtps | M::Vsqrtpd | M::Vrcpps | M::Vrsqrtps | M::Vpabsb | M::Vpabsw
             | M::Vpabsd | M::Vcvtdq2ps | M::Vcvttps2dq | M::Vcvtps2dq | M::Vmovshdup
-            | M::Vmovsldup | M::Vmovddup
+            | M::Vmovsldup | M::Vmovddup | M::Vphminposuw | M::Vaesimc
                 if i.op_count() == 2 =>
             {
                 self.lane(i, &hn, &[1], &[], None)?
             }
-            M::Vroundps | M::Vroundpd | M::Vpshufd | M::Vpshufhw | M::Vpshuflw => {
+            M::Vroundps | M::Vroundpd | M::Vpshufd | M::Vpshufhw | M::Vpshuflw | M::Vaeskeygenassist => {
                 let v = imm().to_string();
                 self.lane(i, &hn, &[1], &[v], None)?
             }

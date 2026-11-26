@@ -10,6 +10,7 @@ use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 pub const RT_HEADER: &str = concat!(include_str!("rt.h"), include_str!("rt_vec.h"));
 
 mod bits;
+mod legacy;
 mod vex;
 
 pub struct FuncIn<'a> {
@@ -683,7 +684,7 @@ impl L<'_> {
             return self.prefixed(i);
         }
         let m = i.mnemonic();
-        if self.sse(i)? || self.vex(i)? || self.bits(i)? {
+        if self.sse(i)? || self.vex(i)? || self.bits(i)? || self.legacy(i)? {
             return Ok(());
         }
         match m {

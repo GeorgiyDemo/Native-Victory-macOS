@@ -75,7 +75,6 @@ pub fn done(a: &mut CodeAssembler) -> Result<(), IcedError> {
     a.ret()
 }
 
-
 #[macro_export]
 macro_rules! sizes {
     ($v:expr, $class:expr, $nm:expr, [$($bits:literal $x:ident $y:ident $z:ident $mp:ident),*], |$a:ident, $ra:ident, $rc:ident, $rd:ident, $mp_:ident| $body:expr) => {
@@ -229,7 +228,6 @@ int main(int argc, char **argv) {
     s
 }
 
-
 /// Assembles, lifts and runs `cases` as x86-64 (Rosetta 2) and arm64, and compares every output line.
 /// `tables` is the number of jump tables the cases contain.
 pub fn run_cases(label: &str, cases: Vec<Case>, tables: usize) {
@@ -237,7 +235,63 @@ pub fn run_cases(label: &str, cases: Vec<Case>, tables: usize) {
         eprintln!("skipped: needs Rosetta 2 and clang");
         return;
     }
-    let (blob, spans) = assemble(&cases);
+    let (dir, spans) = prepare(label, &cases, tables);
+    let (x86, arm) = run_both(&dir, "driver.c", "unit.c", &["image.bin"]);
+    compare(label, &cases, &x86, &arm);
+}
+
+/// One result line of a snippet: the two inputs and the 256 output bytes as 32 qwords.
+pub struct Line {
+    pub name: String,
+    pub a: u64,
+    pub b: u64,
+    pub w: [u64; 32],
+}
+
+/// Lifts `cases` and runs only the arm64 build (for instructions Rosetta 2 cannot run), 300 inputs each.
+pub fn run_arm_only(label: &str, cases: Vec<Case>) -> Vec<Line> {
+    let (dir, _) = prepare(label, &cases, 0);
+    write_runtime(&dir);
+    run(Command::new("clang")
+        .args([
+            "-arch",
+            "arm64",
+            "-O2",
+            "-ffp-contract=off",
+            "-Wno-unused",
+            "-DLIFTED",
+            "-I",
+        ])
+        .arg(&dir)
+        .arg(dir.join("driver.c"))
+        .arg(dir.join("unit.c"))
+        .arg(dir.join("rt_host.c"))
+        .arg("-o")
+        .arg(dir.join("drv_arm")));
+    let out = run(Command::new(dir.join("drv_arm"))
+        .arg("image.bin")
+        .current_dir(&dir));
+    out.lines()
+        .map(|l| {
+            let t: Vec<&str> = l.split_whitespace().collect();
+            let h = |s: &str| u64::from_str_radix(s, 16).unwrap();
+            let mut w = [0u64; 32];
+            for (k, x) in t[3..35].iter().enumerate() {
+                w[k] = h(x);
+            }
+            Line {
+                name: t[2].to_string(),
+                a: h(t[0]),
+                b: h(t[1]),
+                w,
+            }
+        })
+        .collect()
+}
+
+/// Assembles and lifts `cases` into `target/tmp/<label>`; returns the directory and snippet spans.
+fn prepare(label: &str, cases: &[Case], tables: usize) -> (std::path::PathBuf, Vec<(u32, u32)>) {
+    let (blob, spans) = assemble(cases);
 
     // Decode, find jump tables, lift.
     let read_u32 = |rva: u32| {
@@ -322,8 +376,10 @@ pub fn run_cases(label: &str, cases: Vec<Case>, tables: usize) {
         .map(|(c, s)| (c.name.clone(), s.0, c.kind))
         .collect();
     std::fs::write(dir.join("driver.c"), driver_c(&calls)).unwrap();
-    let (x86, arm) = run_both(&dir, "driver.c", "unit.c", &["image.bin"]);
+    (dir, spans)
+}
 
+fn compare(label: &str, cases: &[Case], x86: &str, arm: &str) {
     // Report per class so a failure names the instruction.
     let class_of: HashMap<&str, &str> = cases.iter().map(|c| (c.name.as_str(), c.class)).collect();
     let mut bad: BTreeMap<String, (usize, String, String)> = BTreeMap::new();
@@ -357,3 +413,96 @@ pub fn run_cases(label: &str, cases: Vec<Case>, tables: usize) {
     );
 }
 
+// ---- the ymm prelude shared by the vector diff tests ----
+#[derive(Clone, Copy)]
+pub enum Pre {
+    /// Integer inputs: four qwords per buffer derived from a and b.
+    Int,
+    /// Doubles: the inputs are random and special float64 bit patterns.
+    FpD,
+    /// Floats: the inputs are pairs of random and special float32 bit patterns.
+    FpS,
+}
+
+pub fn pre(a: &mut CodeAssembler, p: Pre) -> Result<(), IcedError> {
+    match p {
+        Pre::FpS | Pre::FpD => {
+            // Lanes are the inputs and their half-swapped forms, so every lane stays a "real" float.
+            a.mov(r9, rcx)?;
+            a.ror(r9, 32)?;
+            a.mov(r10, rdx)?;
+            a.ror(r10, 32)?;
+            for (off, q) in [
+                (128, [rcx, rdx, r9, r10]),
+                (160, [rdx, rcx, r10, r9]),
+                (192, [r9, rdx, rcx, r10]),
+            ] {
+                for (l, r) in q.iter().enumerate() {
+                    a.mov(qword_ptr(r8 + off + 8 * l as i32), *r)?;
+                }
+            }
+        }
+        Pre::Int => {
+            a.mov(qword_ptr(r8 + 128), rcx)?;
+            a.mov(qword_ptr(r8 + 136), rdx)?;
+            a.lea(rax, ptr(rcx + rdx * 4 + 3))?;
+            a.mov(qword_ptr(r8 + 144), rax)?;
+            a.mov(rax, rcx)?;
+            a.xor(rax, rdx)?;
+            a.ror(rax, 13)?;
+            a.mov(qword_ptr(r8 + 152), rax)?;
+            a.mov(qword_ptr(r8 + 160), rdx)?;
+            a.mov(qword_ptr(r8 + 168), rcx)?;
+            a.mov(rax, rcx)?;
+            a.xor(rax, rdx)?;
+            a.not(rax)?;
+            a.mov(qword_ptr(r8 + 176), rax)?;
+            a.mov(rax, rcx)?;
+            a.ror(rax, 19)?;
+            a.sub(rax, rdx)?;
+            a.mov(qword_ptr(r8 + 184), rax)?;
+            a.mov(rax, rdx)?;
+            a.rol(rax, 9)?;
+            a.xor(rax, rcx)?;
+            a.mov(qword_ptr(r8 + 192), rax)?;
+            a.mov(rax, rcx)?;
+            a.sub(rax, rdx)?;
+            a.mov(qword_ptr(r8 + 200), rax)?;
+            a.mov(rax, qword_ptr(r8 + 152))?;
+            a.mov(qword_ptr(r8 + 208), rax)?;
+            a.mov(rax, rdx)?;
+            a.ror(rax, 11)?;
+            a.mov(qword_ptr(r8 + 216), rax)?;
+        }
+    }
+    a.vmovups(ymm1, ymmword_ptr(r8 + 128))?;
+    a.vmovups(ymm2, ymmword_ptr(r8 + 160))?;
+    a.vmovups(ymm3, ymmword_ptr(r8 + 192))?;
+    a.vmovups(ymm0, ymmword_ptr(r8 + 192))?;
+    a.vmovups(ymm4, ymmword_ptr(r8 + 192))?;
+    a.vmovups(ymm5, ymmword_ptr(r8 + 160))?;
+    a.xor(eax, eax)?;
+    Ok(())
+}
+
+pub fn vcase(
+    v: &mut Vec<Case>,
+    class: &'static str,
+    name: String,
+    p: Pre,
+    body: impl Fn(&mut CodeAssembler) -> Result<(), IcedError> + 'static,
+) {
+    let kind = match p {
+        Pre::Int => Kind::Int,
+        Pre::FpS => Kind::Fl,
+        Pre::FpD => Kind::Db,
+    };
+    v.push(case(class, name, kind, move |a, _| {
+        pre(a, p)?;
+        body(a)?;
+        a.vmovups(ymmword_ptr(r8 + 64), ymm0)?;
+        a.vmovups(ymmword_ptr(r8 + 96), ymm4)?;
+        a.mov(qword_ptr(r8 + 8), rax)?;
+        a.ret()
+    }));
+}

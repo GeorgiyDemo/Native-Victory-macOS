@@ -336,3 +336,41 @@ static inline X128 h_fma_sd(X128 d, X128 a, X128 b, X128 c, int ng, int sc) { d.
 /* fmaddsub (sub = 1: even lanes subtract c) and fmsubadd (sub = 0: even lanes add). */
 static inline X128 h_fmas_ps(X128 a, X128 b, X128 c, int sub) { X128 r; LP(4) r.f[k] = fma1f(a.f[k], b.f[k], c.f[k], 0, (k & 1) != sub); return r; }
 static inline X128 h_fmas_pd(X128 a, X128 b, X128 c, int sub) { X128 r; LP(2) r.g[k] = fma1d(a.g[k], b.g[k], c.g[k], 0, (k & 1) != sub); return r; }
+
+/* ---- AES-NI, PCLMULQDQ, phminposuw, SSE4a ----
+ * On arm64 AES and carry-less multiply are the ARM crypto extensions (the `aes` feature covers
+ * PMULL.64). x86 AESENC is ShiftRows/SubBytes/MixColumns then xor key; ARM AESE xors the key first
+ * and has no MixColumns, so a zero key and an explicit xor give the x86 order. */
+#ifdef __aarch64__
+#include <arm_neon.h>
+#define CRY __attribute__((target("aes")))
+static inline uint8x16_t x2v(X128 x) { uint8x16_t v; memcpy(&v, &x, 16); return v; }
+static inline X128 v2x(uint8x16_t v) { X128 r; memcpy(&r, &v, 16); return r; }
+CRY static inline X128 h_vaesenc(X128 s, X128 k) { return v2x(veorq_u8(vaesmcq_u8(vaeseq_u8(x2v(s), vdupq_n_u8(0))), x2v(k))); }
+CRY static inline X128 h_vaesenclast(X128 s, X128 k) { return v2x(veorq_u8(vaeseq_u8(x2v(s), vdupq_n_u8(0)), x2v(k))); }
+CRY static inline X128 h_vaesdec(X128 s, X128 k) { return v2x(veorq_u8(vaesimcq_u8(vaesdq_u8(x2v(s), vdupq_n_u8(0))), x2v(k))); }
+CRY static inline X128 h_vaesdeclast(X128 s, X128 k) { return v2x(veorq_u8(vaesdq_u8(x2v(s), vdupq_n_u8(0)), x2v(k))); }
+CRY static inline X128 h_vaesimc(X128 s) { return v2x(vaesimcq_u8(x2v(s))); }
+/* SubWord through AESE: with the same word in all four columns ShiftRows changes nothing. */
+CRY static inline u32 aes_subword(u32 w) {
+  uint8x16_t v = vaeseq_u8(vreinterpretq_u8_u32(vdupq_n_u32(w)), vdupq_n_u8(0));
+  return vgetq_lane_u32(vreinterpretq_u32_u8(v), 0);
+}
+CRY static inline X128 h_vaeskeygenassist(X128 a, int rcon) {
+  u32 x1 = aes_subword(a.d[1]), x3 = aes_subword(a.d[3]);
+  X128 r; r.d[0] = x1; r.d[1] = (x1 >> 8 | x1 << 24) ^ (u32)rcon; r.d[2] = x3; r.d[3] = (x3 >> 8 | x3 << 24) ^ (u32)rcon;
+  return r;
+}
+CRY static inline X128 h_vpclmulqdq(X128 a, X128 b, int m) {
+  poly128_t p = vmull_p64((poly64_t)a.q[m & 1], (poly64_t)b.q[(m >> 4) & 1]);
+  X128 r; memcpy(&r, &p, 16); return r;
+}
+#endif
+/* Smallest of the eight words: value in word 0, its (first) index in word 1, the rest zero. */
+static inline X128 h_vphminposuw(X128 a) { X128 r = xz(); int best = 0; LP(8) if (a.w[k] < a.w[best]) best = k; r.w[0] = a.w[best]; r.w[1] = (u16)best; return r; }
+/* SSE4a: bit-field insert/extract on the low qword; length 0 means 64, the high qword is left alone. */
+static inline u64 fld_mask(unsigned len) { return len == 0 || len >= 64 ? ~0ull : (1ull << len) - 1; }
+static inline X128 h_insertq(X128 d, X128 s, unsigned len, unsigned idx) {
+  len &= 63; idx &= 63; u64 m = fld_mask(len) << idx; d.q[0] = (d.q[0] & ~m) | ((s.q[0] << idx) & m); return d;
+}
+static inline X128 h_extrq(X128 d, unsigned len, unsigned idx) { len &= 63; idx &= 63; d.q[0] = (d.q[0] >> idx) & fld_mask(len); return d; }
