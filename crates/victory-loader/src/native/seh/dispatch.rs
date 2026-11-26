@@ -341,6 +341,12 @@ unsafe fn resume_with(ctx: *const Context, _ret: u64) -> ! {
         // The dispatches in progress are on host frames the resume drops; their `frame_addr`s are not
         // comparable with a guest rsp, so all go (a dispatch begun inside a handler is forgotten).
         ACTIVE.with(|a| a.borrow_mut().clear());
+        // A `RaiseException` the handler continued: back out of the dispatch to the call.
+        // SAFETY: valid, per the caller.
+        let at = unsafe { (*ctx).rip };
+        if _ret == 0 && at != 0 && CONTINUE_AT.get() == at {
+            std::panic::resume_unwind(Box::new(Continued));
+        }
         // SAFETY: forwarded from the caller.
         unsafe { crate::native::guest::resume(ctx, _ret) }
     }
@@ -379,8 +385,39 @@ pub unsafe fn raise_record(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     dispatch_exception(ctx, rec, 0)
 }
 
+/// What a continued `RaiseException` unwinds the dispatch's host frames with.
+#[cfg(target_arch = "aarch64")]
+struct Continued;
+
+#[cfg(target_arch = "aarch64")]
+thread_local! {
+    /// The `rip` a `RaiseException` made by guest code returns to (0 outside one).
+    static CONTINUE_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`raise_record`] for `RaiseException` called from guest code: returns true when a handler (a vectored one, say,
+/// as for the debugger-name exception `0x406D1388`) continued execution at the instruction after the call, so the
+/// caller can return from the import; every other end is as for [`raise_record`]. A handler's changes to the
+/// registers are not carried back.
+///
+/// # Safety
+/// As [`raise_record`]; `ctx.rip` is the return address of the guest call that is being served.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn raise_record_continuable(ctx: *mut Context, rec: *mut ExceptionRecord) -> bool {
+    // SAFETY: valid, per the caller.
+    let rip = unsafe { (*ctx).rip };
+    let saved = CONTINUE_AT.replace(rip);
+    // SAFETY: forwarded.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { raise_record(ctx, rec) }));
+    CONTINUE_AT.set(saved);
+    match result {
+        Err(payload) if payload.is::<Continued>() => true,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 /// Runs on the host's GS base, entered from `victory_exception_entry`.
-extern "C" fn dispatch_exception(ctx: *mut Context, rec: *mut ExceptionRecord, _teb: usize) -> ! {
+extern "C-unwind" fn dispatch_exception(ctx: *mut Context, rec: *mut ExceptionRecord, _teb: usize) -> ! {
     let marker = 0u8;
     let frame_addr = std::ptr::from_ref(&marker) as usize;
     ACTIVE.with(|a| a.borrow_mut().push(Active { ctx, frame_addr }));

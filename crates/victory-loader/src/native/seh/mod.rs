@@ -40,6 +40,10 @@ pub mod signal;
 pub use dispatch::{
     Handler, add_vectored_handler, backtrace, raise_record, remove_vectored_handler, set_unhandled_filter,
 };
+#[cfg(target_arch = "aarch64")]
+pub use dispatch::{
+    raise_record_continuable,
+};
 #[cfg(target_arch = "x86_64")]
 pub use signal::install;
 

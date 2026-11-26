@@ -58,13 +58,25 @@ fn is_cmov_free_load(code: Code) -> bool {
 /// `movsxd r,[base+idx*4]`) and MSVC (`lea base,[__ImageBase]` then
 /// `mov r32,[base+idx*4+table_rva]`), each followed by `add r,base; jmp r`.
 pub fn find_jump_tables(img: &Image, f: &Func, ins: &[Instruction]) -> Vec<JumpTable> {
-    find_jump_tables_with(img.info.image_base, &|rva| img.read_u32(rva), f, ins)
+    find_jump_tables_ext(img.info.image_base, &|rva| img.read_u32(rva), &|rva| img.is_exec(rva), f, ins)
 }
 
-/// Same, over any RVA-addressed `u32` reader (used by tests on raw blobs).
+/// Same, over any RVA-addressed `u32` reader (used by tests on raw blobs). A case outside the function ends the table.
 pub fn find_jump_tables_with(
     base: u64,
     read_u32: &dyn Fn(u32) -> Option<u32>,
+    f: &Func,
+    ins: &[Instruction],
+) -> Vec<JumpTable> {
+    find_jump_tables_ext(base, read_u32, &|_| false, f, ins)
+}
+
+/// [`find_jump_tables_with`] where a case that lies outside the function but in code (`is_code`) is kept: a switch
+/// whose case is a tail call into another function. The table ends at the first case that is not code.
+pub fn find_jump_tables_ext(
+    base: u64,
+    read_u32: &dyn Fn(u32) -> Option<u32>,
+    is_code: &dyn Fn(u32) -> bool,
     f: &Func,
     ins: &[Instruction],
 ) -> Vec<JumpTable> {
@@ -84,11 +96,21 @@ pub fn find_jump_tables_with(
                 return None;
             }
             let base_reg = ld.memory_base();
-            ins[..n]
+            let ld_at = ins[..n].iter().rposition(|i| std::ptr::eq(i, ld) || i.ip() == ld.ip())?;
+            let lea_at = ins[..ld_at]
                 .iter()
-                .rev()
-                .find(|i| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.op0_register() == base_reg)
-                .map(|lea| (ld, lea))
+                .rposition(|i| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.op0_register() == base_reg)?;
+            // The loaded offset is added to the base into the register the `jmp` takes (anything else, a vtable
+            // call through a register, say, is not a switch).
+            let jr = j.op0_register().full_register();
+            let added = ins[ld_at + 1..n].iter().any(|i| {
+                i.mnemonic() == iced_x86::Mnemonic::Add
+                    && i.op0_kind() == OpKind::Register
+                    && i.op1_kind() == OpKind::Register
+                    && i.op0_register().full_register() == jr
+                    && (i.op1_register().full_register() == base_reg.full_register() || jr == base_reg.full_register())
+            });
+            added.then(|| (ld, &ins[lea_at]))
         }) else {
             continue;
         };
@@ -118,7 +140,11 @@ pub fn find_jump_tables_with(
         // The compare the range check `ja default` follows. With none, the table runs as far as its entries land
         // inside the function (a compare of something else would cut a real table short, and a missing entry is a
         // trap at run time, where an extra one is only a label).
-        let pick = (0..win.len()).rev().find(|&k| is_cmp(&win[k]) && ja_after(k));
+        // Only a compare of the register the table is indexed by bounds it (another register's range check, a few
+        // instructions earlier, would cut the table short).
+        let idx = ld.memory_index().full_register();
+        let on_index = |i: &Instruction| i.op0_kind() == OpKind::Register && i.op0_register().full_register() == idx;
+        let pick = (0..win.len()).rev().find(|&k| is_cmp(&win[k]) && on_index(&win[k]) && ja_after(k));
         let bound = pick
             .map(|k| {
                 let c = &win[k];
@@ -139,7 +165,7 @@ pub fn find_jump_tables_with(
             } else {
                 lea_rva.wrapping_add(e as i32 as u32)
             };
-            if t < f.begin || t >= f.end {
+            if (t < f.begin || t >= f.end) && (bound.is_none() || !is_code(t)) {
                 break;
             }
             targets.push(t);

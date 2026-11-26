@@ -373,6 +373,11 @@ impl L<'_> {
     }
 
     /// Statement that transfers control to guest address `t`.
+    /// Whether `t` is inside this function (its range or a chained part).
+    fn inside(&self, t: u64) -> bool {
+        (self.f.begin_va..self.f.end_va).contains(&t) || self.f.extra.iter().any(|&(b, e)| (b..e).contains(&t))
+    }
+
     fn jump_to(&self, t: u64, _labels: &BTreeSet<u64>) -> String {
         if self.ips.contains(&t) {
             format!("goto L_{t:x};")
@@ -976,13 +981,18 @@ impl L<'_> {
                     let r = self.rd(i, 0, 64)?;
                     // No recovered table: a tail call through a register (or a switch we could not
                     // decode); hand it to the dispatcher, which logs it if it is not a function start.
-                    let Some(ts) = self.f.tables.get(&i.ip()).filter(|ts| ts.iter().all(|t| self.ips.contains(t))) else {
+                    let Some(ts) = self.f.tables.get(&i.ip()).filter(|ts| ts.iter().all(|t| self.ips.contains(t) || !self.inside(*t))) else {
                         self.emit(&format!("{{ u64 t = {r}; {}; rt_dispatch(c, t); return; }}", self.sp()));
                         return Ok(());
                     };
                     let mut sw = format!("switch ({r} - (u64)IMG + IMAGE_BASE) {{ ");
                     for t in ts.iter().collect::<BTreeSet<_>>() {
-                        let _ = write!(sw, "case {t:#x}ull: goto L_{t:x}; ");
+                        if self.ips.contains(t) {
+                            let _ = write!(sw, "case {t:#x}ull: goto L_{t:x}; ");
+                        } else {
+                            // A case that is another function: a tail call.
+                            let _ = write!(sw, "case {t:#x}ull: {{ {}; rt_dispatch(c, {r}); return; }} ", self.sp());
+                        }
                     }
                     sw.push_str("default: rt_trap(\"jump table index out of range\"); }");
                     self.emit(&sw);
@@ -1054,9 +1064,72 @@ fn uses_vector(i: &Instruction) -> bool {
 pub fn lift_function(ctx: &Ctx, f: &FuncIn) -> Result<String, String> {
     let (o, errs) = lift_core(ctx, f, false);
     match errs.into_iter().next() {
-        Some(e) => Err(e),
+        Some(e) => {
+            // Data inside the function's range (a jump table or constants after the `ret`) decodes as junk the lifter
+            // cannot take; if it is not reachable from the entry, leave it out and lift the code.
+            let live = reachable(f);
+            if live.len() == f.ins.len() {
+                return Err(e);
+            }
+            let ins: Vec<Instruction> = f.ins.iter().filter(|i| live.contains(&i.ip())).copied().collect();
+            let pruned = FuncIn {
+                begin_va: f.begin_va,
+                end_va: f.end_va,
+                ins: &ins,
+                tables: f.tables.clone(),
+                extra: f.extra.clone(),
+                landing_pads: f.landing_pads.clone(),
+            };
+            let (o, errs) = lift_core(ctx, &pruned, false);
+            match errs.into_iter().next() {
+                Some(_) => Err(e),
+                None => Ok(o),
+            }
+        }
         None => Ok(o),
     }
+}
+
+/// The instructions reachable from the entry, the landing pads and the chained parts by falling through, branching and
+/// the recovered jump tables.
+fn reachable(f: &FuncIn) -> std::collections::HashSet<u64> {
+    use iced_x86::FlowControl as FC;
+    let at: std::collections::HashMap<u64, usize> = f.ins.iter().enumerate().map(|(k, i)| (i.ip(), k)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut work: Vec<u64> = vec![f.begin_va];
+    work.extend(f.landing_pads.iter().copied());
+    work.extend(f.extra.iter().map(|&(b, _)| b));
+    while let Some(ip) = work.pop() {
+        let Some(&k) = at.get(&ip) else { continue };
+        for i in &f.ins[k..] {
+            if !seen.insert(i.ip()) {
+                break;
+            }
+            match i.flow_control() {
+                FC::ConditionalBranch => {
+                    work.push(i.near_branch_target());
+                }
+                FC::UnconditionalBranch => {
+                    if i.op0_kind() == OpKind::NearBranch64 {
+                        work.push(i.near_branch_target());
+                    } else if let Some(ts) = f.tables.get(&i.ip()) {
+                        work.extend(ts.iter().copied());
+                    }
+                    break;
+                }
+                FC::IndirectBranch => {
+                    if let Some(ts) = f.tables.get(&i.ip()) {
+                        work.extend(ts.iter().copied());
+                    }
+                    break;
+                }
+                FC::Return => break,
+                FC::Exception if matches!(i.mnemonic(), Mnemonic::Ud2) => break,
+                _ => {}
+            }
+        }
+    }
+    seen
 }
 
 /// Every unsupported-instruction error in `f` (not just the first), for ranking what to lift next.
@@ -1078,8 +1151,9 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         }
     }
     let ipset: std::collections::HashSet<u64> = f.ins.iter().map(|i| i.ip()).collect();
-    for ts in f.tables.values().filter(|ts| ts.iter().all(|t| ipset.contains(t))) {
-        labels.extend(ts.iter().copied());
+    let inside = |t: &u64| (f.begin_va..f.end_va).contains(t) || f.extra.iter().any(|&(b, e)| (b..e).contains(t));
+    for ts in f.tables.values().filter(|ts| ts.iter().all(|t| ipset.contains(t) || !inside(t))) {
+        labels.extend(ts.iter().copied().filter(|t| ipset.contains(t)));
     }
     let pads: Vec<u64> = f.landing_pads.iter().copied().filter(|p| ipset.contains(p)).collect();
     labels.extend(pads.iter().copied());

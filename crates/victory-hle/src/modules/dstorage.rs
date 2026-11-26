@@ -188,7 +188,7 @@ fn open_for_reading(path: *const u16, _name: &str) -> std::io::Result<std::fs::F
 }
 
 /// Goes through the POSIX host's drive table, so virtual drives work too.
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 fn open_for_reading(path: *const u16, _name: &str) -> std::io::Result<std::fs::File> {
     // SAFETY: the title passes a NUL-terminated path.
     let wide = unsafe {
@@ -199,7 +199,7 @@ fn open_for_reading(path: *const u16, _name: &str) -> std::io::Result<std::fs::F
     std::fs::File::open(host)
 }
 
-#[cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn open_for_reading(_path: *const u16, name: &str) -> std::io::Result<std::fs::File> {
     std::fs::File::open(name)
 }

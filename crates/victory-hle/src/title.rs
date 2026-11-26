@@ -198,7 +198,8 @@ pub mod arm64 {
             if !args.is_null() {
                 std::ptr::copy_nonoverlapping(args, rec.information.as_mut_ptr(), count);
             }
-            victory_loader::native::seh::raise_record(&raw mut ctx, &raw mut rec)
+            // A handler that continues a software exception returns to the caller.
+            victory_loader::native::seh::raise_record_continuable(&raw mut ctx, &raw mut rec);
         }
     }
 

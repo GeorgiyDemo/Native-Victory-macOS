@@ -25,12 +25,17 @@ fn section_end(img: &Image, rva: u32) -> u32 {
 /// Walks from `start` (not past `limit`) and returns the end of the function and
 /// the direct branch/call targets seen.
 fn walk(img: &Image, start: u32, limit: u32) -> (u32, Vec<u32>) {
+    walk_to(img, start, limit, start)
+}
+
+/// [`walk`] that does not stop before `reach` (the farthest case of a jump table found in the code walked so far).
+fn walk_to(img: &Image, start: u32, limit: u32, reach: u32) -> (u32, Vec<u32>) {
     let base = img.info.image_base;
     let Some(code) = img.bytes(start, (limit - start) as usize) else {
         return (start, vec![]);
     };
     let mut dec = Decoder::with_ip(64, code, base + start as u64, DecoderOptions::NONE);
-    let mut max_fwd = start;
+    let mut max_fwd = reach;
     let mut targets = vec![];
     let mut end = start;
     while dec.can_decode() {
@@ -131,7 +136,28 @@ pub fn discover_with(img: &Image, extra: &[u32]) -> anyhow::Result<Vec<Func>> {
         .collect();
     for &t in &gap {
         let next = all.range(t + 1..).next().copied().unwrap_or(u32::MAX);
-        let (end, _) = walk(img, t, next.min(section_end(img, t)));
+        let t0 = t;
+        let limit = next.min(section_end(img, t));
+        let (mut end, _) = walk(img, t, limit);
+        // A switch's cases can lie past an `int3` or `ret` the walk took for the end: extend over the farthest case
+        // of any jump table the code walked so far reads.
+        for _ in 0..8 {
+            if end <= t {
+                break;
+            }
+            let part = Func { begin: t, end, unwind: 0, chained: false };
+            let wide = Func { begin: t, end: limit, unwind: 0, chained: false };
+            let (ins, _) = crate::analyze::decode_function(img, &part);
+            let far = crate::analyze::find_jump_tables(img, &wide, &ins)
+                .iter()
+                .flat_map(|j| j.targets.iter().copied())
+                .filter(|&t| t >= t0 && t < limit)
+                .max();
+            match far {
+                Some(m) if m >= end => end = walk_to(img, t, limit, m + 1).0,
+                _ => break,
+            }
+        }
         if end > t {
             known.push(Func {
                 begin: t,
