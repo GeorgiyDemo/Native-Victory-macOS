@@ -18,3 +18,8 @@ void rt_dispatch(Cpu *c, u64 target) {
   if (lo < rt_table_n && rt_table[lo].rva == rva) { rt_table[lo].fn(c); return; }
   rt_unresolved(c, target);
 }
+
+/* Prototype answers: no CPU features, XCR0 = x87+SSE+AVX, a monotonic counter. */
+void rt_cpuid(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d) { (void)leaf; (void)sub; *a = *b = *c = *d = 0; }
+u64 rt_xgetbv(u32 index) { (void)index; return 7; }
+u64 rt_rdtsc(void) { static u64 t; return t += 100; }

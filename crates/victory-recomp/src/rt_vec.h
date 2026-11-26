@@ -259,8 +259,19 @@ static inline X128 h_vcvtpd2dq(X128 a) { X128 r = xz(); LP(2) r.sd[k] = cvt32(a.
 static inline X128 h_vcvtps2pd(X128 a, int off) { X128 r; LP(2) r.g[k] = (double)a.f[off + k]; return r; }
 static inline X128 h_vcvtdq2pd(X128 a, int off) { X128 r; LP(2) r.g[k] = (double)a.sd[off + k]; return r; }
 static inline X128 h_vcvtph2ps(X128 a, int off) { X128 r; LP(4) { u16 h = a.w[off + k]; _Float16 t; memcpy(&t, &h, 2); r.f[k] = (float)t; } return r; }
-/* Narrowing to half: four floats to the low four halves (upper zero). Rounding is nearest-even. */
-static inline X128 h_vcvtps2ph(X128 a) { X128 r = xz(); LP(4) { _Float16 t = (_Float16)a.f[k]; u16 h; memcpy(&h, &t, 2); r.w[k] = h; } return r; }
+/* float -> half bits. mode: 0 nearest-even, 1 down, 2 up, 3 toward zero. */
+static inline u16 f2h(float f, int mode) {
+  _Float16 t = (_Float16)f; u16 h; memcpy(&h, &t, 2);
+  if (mode == 0 || f != f || f - f != 0) return h; /* nearest-even, NaN, infinity */
+  float hf = (float)t;
+  if (hf == f) return h;
+  int up = mode == 2 || (mode == 3 && f < 0), down = mode == 1 || (mode == 3 && f > 0);
+  if (up && hf < f) h = (h & 0x8000) ? (h == 0x8000 ? 0x0001 : h - 1) : h + 1;
+  else if (down && hf > f) h = (h & 0x8000) ? h + 1 : (h == 0 ? 0x8001 : h - 1);
+  return h;
+}
+/* Narrowing to half: four floats to the low four halves (upper zero). */
+static inline X128 h_vcvtps2ph(X128 a, int imm) { X128 r = xz(); int mode = (imm & 4) ? 0 : (imm & 3); LP(4) r.w[k] = f2h(a.f[k], mode); return r; }
 
 static inline X128 h_bcb(X128 s) { X128 r; LP(16) r.b[k] = s.b[0]; return r; }
 static inline X128 h_bcw(X128 s) { X128 r; LP(8) r.w[k] = s.w[0]; return r; }

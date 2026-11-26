@@ -596,13 +596,10 @@ impl L<'_> {
             M::Vcvtps2ph => {
                 let (k, wide) = vreg(i.op1_register())?;
                 let v = imm();
-                if v & 4 == 0 && v & 3 != 0 {
-                    return Err("vcvtps2ph with a directed rounding mode".into());
-                }
                 let t = if wide {
-                    format!("{{ X128 l = h_vcvtps2ph(x{k}), u = h_vcvtps2ph(xh{k}); X128 t; t.q[0] = l.q[0]; t.q[1] = u.q[0];")
+                    format!("{{ X128 l = h_vcvtps2ph(x{k}, {v}), u = h_vcvtps2ph(xh{k}, {v}); X128 t; t.q[0] = l.q[0]; t.q[1] = u.q[0];")
                 } else {
-                    format!("{{ X128 t = h_vcvtps2ph(x{k});")
+                    format!("{{ X128 t = h_vcvtps2ph(x{k}, {v});")
                 };
                 if i.op0_kind() == OpKind::Memory {
                     let a = self.addr(i)?;

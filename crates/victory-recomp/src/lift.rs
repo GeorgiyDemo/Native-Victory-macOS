@@ -9,6 +9,7 @@ use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 
 pub const RT_HEADER: &str = concat!(include_str!("rt.h"), include_str!("rt_vec.h"));
 
+mod bits;
 mod vex;
 
 pub struct FuncIn<'a> {
@@ -604,10 +605,10 @@ impl L<'_> {
         use Mnemonic as M;
         if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repe_prefix() || i.has_repne_prefix()
         {
-            return Err("lock/rep prefix".into());
+            return self.prefixed(i);
         }
         let m = i.mnemonic();
-        if self.sse(i)? || self.vex(i)? {
+        if self.sse(i)? || self.vex(i)? || self.bits(i)? {
             return Ok(());
         }
         match m {

@@ -85,6 +85,29 @@ static inline void fl_set_ucomi(Fl *f, double a, double b) {
   f->k = FK_RAW; f->c = (u64)cf | (u64)zf << 1 | (u64)pf << 4;
 }
 
+/* Update one flag, keep the rest. */
+static inline void fl_set_flag(Fl *f, int bit, int v) {
+  u64 c = (u64)fl_cf(f) | (u64)fl_zf(f) << 1 | (u64)fl_sf(f) << 2 | (u64)fl_of(f) << 3 | (u64)fl_pf(f) << 4;
+  c = (c & ~(1ull << bit)) | (u64)(v != 0) << bit;
+  f->k = FK_RAW; f->c = c;
+}
+#define fl_set_cf(f, v) fl_set_flag(f, 0, v)
+#define fl_set_zf(f, v) fl_set_flag(f, 1, v)
+#define fl_set_of(f, v) fl_set_flag(f, 3, v)
+/* RFLAGS image (AF not modelled, IF set as in user mode) and back. */
+static inline u64 fl_pack(const Fl *f) {
+  return (u64)fl_cf(f) | 2 | (u64)fl_pf(f) << 2 | (u64)fl_zf(f) << 6 | (u64)fl_sf(f) << 7 | 0x200 | (u64)fl_of(f) << 11;
+}
+static inline void fl_unpack(Fl *f, u64 v) {
+  f->k = FK_RAW; f->c = (v & 1) | (v >> 6 & 1) << 1 | (v >> 7 & 1) << 2 | (v >> 11 & 1) << 3 | (v >> 2 & 1) << 4;
+}
+static inline u64 pdep64(u64 src, u64 m) { u64 r = 0; for (u64 b = 1; m; b <<= 1) { u64 low = m & -m; if (src & b) r |= low; m &= m - 1; } return r; }
+static inline u64 pext64(u64 src, u64 m) { u64 r = 0; for (u64 b = 1; m; b <<= 1) { u64 low = m & -m; if (src & low) r |= b; m &= m - 1; } return r; }
+/* Host services for instructions the lifted code cannot do itself. */
+void rt_cpuid(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d);
+u64 rt_xgetbv(u32 index);
+u64 rt_rdtsc(void);
+
 /* x86 returns the negative "real indefinite" QNaN for invalid operations; ARM returns a positive one. */
 /* Done on the bit patterns: LLVM treats every NaN as equivalent and would delete a float-typed fix-up. */
 static inline double nanfix_d(double r, double a, double b) {

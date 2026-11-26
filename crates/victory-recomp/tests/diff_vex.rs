@@ -437,7 +437,7 @@ fn convert_cases(v: &mut Vec<Case>) {
     vcase(v, "avx-f16", "vcvtph2ps_y".into(), Pre::Int, |a| a.vcvtph2ps(ymm0, xmm2));
     vcase(v, "avx-f16", "vcvtph2ps_xm".into(), Pre::Int, |a| a.vcvtph2ps(xmm0, qword_ptr(r8 + 160)));
     vcase(v, "avx-f16", "vcvtph2ps_ym".into(), Pre::Int, |a| a.vcvtph2ps(ymm0, xmmword_ptr(r8 + 160)));
-    for m in [0, 4] {
+    for m in [0, 1, 2, 3, 4] {
         vcase(v, "avx-f16", format!("vcvtps2ph_x{m}"), Pre::FpS, move |a| a.vcvtps2ph(xmm0, xmm2, m));
         vcase(v, "avx-f16", format!("vcvtps2ph_y{m}"), Pre::FpS, move |a| a.vcvtps2ph(xmm0, ymm2, m));
         vcase(v, "avx-f16", format!("vcvtps2ph_ms{m}"), Pre::FpS, move |a| { a.vcvtps2ph(qword_ptr(r8 + SCRATCH), xmm2, m)?; readback(a) });
