@@ -5,7 +5,9 @@
 
 mod census;
 mod inspect;
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
+mod native_arch;
+#[cfg(target_os = "macos")]
 mod native_run;
 #[cfg(windows)]
 mod prebuild;
@@ -13,7 +15,7 @@ mod run;
 mod shader;
 #[cfg(windows)]
 mod translate;
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 mod window;
 
 use std::path::PathBuf;

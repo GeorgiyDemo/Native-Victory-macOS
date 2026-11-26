@@ -508,7 +508,7 @@ unsafe fn walk_frames(ctx: *mut Context, rec: *mut ExceptionRecord) {
         if let Some((base, entry, u)) = handler
             && u.handler != 0
         {
-            let mut dc = dispatcher_context(base, pc, entry, u, std::ptr::null_mut());
+            let mut dc = dispatcher_context(base, frame_ctx.rip as usize, entry, u, std::ptr::null_mut());
             let pass: *mut Context = if first { ctx } else { &mut frame_ctx };
             dc.context_record = pass;
             // SAFETY: a title language handler: four pointer arguments.
@@ -666,7 +666,7 @@ unsafe extern "C" fn unwind_ex(
                             (*rec).flags |= EXCEPTION_TARGET_UNWIND;
                         }
                     }
-                    let mut dc = dispatcher_context(base, pc, entry, u, &raw mut frame_ctx);
+                    let mut dc = dispatcher_context(base, frame_ctx.rip as usize, entry, u, &raw mut frame_ctx);
                     dc.target_ip = target_ip as u64;
                     // SAFETY: a title language handler.
                     unsafe {

@@ -13,7 +13,18 @@
 u8 *IMG; /* one image, compiled into the same dylib as the runtime */
 #endif
 
-void rt_trap(const char *why) { fprintf(stderr, "rt_trap: %s\n", why); abort(); }
+static __thread u8 *tl_gs, *tl_lo, *tl_hi;
+extern __thread u64 rt_resume_va;
+void rt_trap(const char *why) {
+  if (rt_resume_va) fprintf(stderr, "rt_trap: last resume address %#llx\n", (unsigned long long)rt_resume_va);
+  /* Which lifted function trapped: its symbol (f_<rva> or fb_<rva>) and the image it is in. */
+  Dl_info di;
+  if (dladdr(__builtin_return_address(0), &di) && di.dli_sname)
+    fprintf(stderr, "rt_trap: %s (in %s, %s)\n", why, di.dli_sname, di.dli_fname ? di.dli_fname : "?");
+  else fprintf(stderr, "rt_trap: %s\n", why);
+  if (getenv("RT_TRAP_TLS") && tl_gs) { u64 *arr = *(u64 **)(tl_gs + 0x58); fprintf(stderr, "rt_trap: gs=%p tls_array=%p [0]=%llx [1]=%llx epoch0=%d\n", (void*)tl_gs, (void*)arr, arr ? (unsigned long long)arr[0] : 0, arr ? (unsigned long long)arr[1] : 0, arr && arr[0] ? *(int*)(arr[0] + 4) : 0); }
+  abort();
+}
 
 /* ---- dispatch: one table per lifted image ----
  * A process can hold several images (the exe and the DLLs it ships), each a lifted unit of its own (a dylib that
@@ -111,6 +122,14 @@ static void import_call(Cpu *c, const RtImport *m) {
   const RtImport *saved_imp = rt_cur_imp;
   rt_cur = c;
   rt_cur_imp = m;
+  /* RT_TRACE_IMPORTS=1: one line per import call (thread, name, the first four integer arguments, and the result
+   * below), the sequence to compare against another host. */
+  static int trace = -1;
+  if (trace < 0) trace = getenv("RT_TRACE_IMPORTS") != 0;
+  if (trace) {
+    uint64_t tid; pthread_threadid_np(0, &tid);
+    fprintf(stderr, "imp t%llu %s(%llx,%llx,%llx,%llx)\n", (unsigned long long)tid, m->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2], (unsigned long long)c->r[8], (unsigned long long)c->r[9]);
+  }
   if (m->raw) {
     m->raw(c);
   } else {
@@ -120,6 +139,7 @@ static void import_call(Cpu *c, const RtImport *m) {
     for (unsigned i = 0; i < m->argc; i++) {
       int isf = (m->fmask | m->smask) >> i & 1;
       u64 v = i < 4 ? (isf ? c->x[i].q[0] : c->r[reg[i]]) : ld64((u8 *)(c->r[4] + 8 + 8 * (u64)i));
+      if (m->bmask >> i & 1) v &= 0xff; else if (m->hmask >> i & 1) v &= 0xffff; /* Apple arm64 callees may assume extended narrow arguments */
       if (isf) { if (nf == 8) rt_trap("more than 8 floating-point import arguments"); memcpy(&da[nf++], &v, 8); }
       else { if (ni == 16) rt_trap("more than 16 integer import arguments"); ia[ni++] = v; }
     }
@@ -133,6 +153,7 @@ static void import_call(Cpu *c, const RtImport *m) {
     }
     }
   }
+  if (trace) fprintf(stderr, "  = %llx\n", (unsigned long long)c->r[0]);
   rt_cur = saved;
   rt_cur_imp = saved_imp;
   c->r[4] += 8; /* the import's `ret`: pop the return address the call pushed */
@@ -182,7 +203,6 @@ void rt_dispatch(Cpu *c, u64 target) {
 }
 
 /* ---- guest threads and callbacks ---- */
-static __thread u8 *tl_gs, *tl_lo, *tl_hi;
 
 void rt_thread_init(u8 *gs, u8 *lo, u8 *hi) { tl_gs = gs; tl_lo = lo; tl_hi = hi; }
 

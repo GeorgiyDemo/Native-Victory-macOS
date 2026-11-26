@@ -647,6 +647,20 @@ impl L<'_> {
                 }
                 let _ = sz;
             }
+            M::Movntps | M::Movntpd | M::Movntdq => {
+                let (a, s) = (self.addr(i)?, Self::xreg(i, 1)?);
+                self.emit(&format!("st128({a}, {s});"));
+            }
+            M::Movntdqa => {
+                let (d, s) = (Self::xreg(i, 0)?, self.x128(i, 1)?);
+                self.emit(&format!("{d} = {s};"));
+            }
+            M::Movnti => {
+                let bits = Self::bits0(i)?;
+                let v = self.rd(i, 1, bits)?;
+                let w = self.wr(i, 0, &v)?;
+                self.emit(&w);
+            }
             M::Movaps | M::Movups | M::Movapd | M::Movupd | M::Movdqa | M::Movdqu => {
                 if i.op0_kind() == OpKind::Memory {
                     let (a, s) = (self.addr(i)?, Self::xreg(i, 1)?);
@@ -723,7 +737,16 @@ impl L<'_> {
 
     fn insn_inner(&mut self, i: &Instruction, labels: &BTreeSet<u64>) -> R<()> {
         use Mnemonic as M;
-        if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repe_prefix() || i.has_repne_prefix()
+        if i.has_lock_prefix()
+            || i.has_rep_prefix()
+            || i.has_repe_prefix()
+            || i.has_repne_prefix()
+            // A string instruction on its own (one element, direction flag clear).
+            || matches!(
+                i.mnemonic(),
+                M::Scasb | M::Scasw | M::Scasd | M::Scasq | M::Stosb | M::Stosw | M::Stosq | M::Lodsb | M::Lodsw
+                    | M::Lodsd | M::Lodsq | M::Movsb | M::Movsw | M::Movsq | M::Cmpsb | M::Cmpsw | M::Cmpsq
+            )
         {
             return self.prefixed(i);
         }

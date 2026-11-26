@@ -11,6 +11,16 @@ use super::image::NativeImage;
 use super::teb;
 use crate::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH};
 
+/// The host thread stack under title code. Recompiled code (the arm64 host) keeps its own guest stack, but
+/// every guest call is also a C frame of the host thread, and lifted frames are large.
+fn host_stack(size: usize) -> usize {
+    if cfg!(target_arch = "aarch64") {
+        size.saturating_mul(16).max(64 << 20)
+    } else {
+        size
+    }
+}
+
 /// Calls the image's TLS callbacks with `reason` (`DLL_PROCESS_ATTACH`...)
 /// on the calling thread.
 ///
@@ -169,7 +179,7 @@ pub unsafe fn spawn_title_thread_with(
     on_start: impl FnOnce() + Send + 'static,
     on_exit: impl FnOnce(u32) + Send + 'static,
 ) -> std::io::Result<Thread> {
-    thread::spawn(name, stack_size, move || {
+    thread::spawn(name, host_stack(stack_size), move || {
         on_start();
         notify_threads(DLL_THREAD_ATTACH);
         // SAFETY: forwarded from the caller.
@@ -214,7 +224,7 @@ pub unsafe fn run_entry_with(
     let dlls = dlls.to_vec();
     let failure = std::sync::Arc::new(Mutex::new(None::<String>));
     let failed = failure.clone();
-    let thread = thread::spawn("title-main", stack, move || {
+    let thread = thread::spawn("title-main", host_stack(stack), move || {
         // SAFETY: forwarded from the caller.
         unsafe {
             for (i, dll) in dlls.iter().enumerate() {

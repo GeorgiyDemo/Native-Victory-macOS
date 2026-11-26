@@ -57,6 +57,7 @@ typedef struct {
   u8 argc;
   u16 fmask, smask;   /* bit i: argument i is a double / a float */
   u8 ret;
+  u16 bmask, hmask;   /* bit i: integer argument i is 8 / 16 bits wide (the rest of its register is undefined) */
 } RtImport;
 u64 rt_import_bind(const RtImport *imp);
 const char *rt_import_name(u64 thunk);

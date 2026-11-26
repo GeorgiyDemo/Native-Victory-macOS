@@ -602,7 +602,7 @@ mod cpu_check_tests {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     exe: &Path,
@@ -626,7 +626,7 @@ pub fn run(
     )
 }
 
-#[cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))]
+#[cfg(not(any(windows, target_os = "macos")))]
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     _: &Path,
@@ -638,5 +638,5 @@ pub fn run(
     _: &[String],
     _: bool,
 ) -> Result<u32> {
-    anyhow::bail!("running titles requires Windows, or macOS on x86-64 (native host)")
+    anyhow::bail!("running titles requires Windows or macOS (native host)")
 }

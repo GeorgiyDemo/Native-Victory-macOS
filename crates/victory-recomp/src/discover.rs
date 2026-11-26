@@ -74,6 +74,12 @@ fn walk(img: &Image, start: u32, limit: u32) -> (u32, Vec<u32>) {
 
 /// All functions: `.pdata` entries plus discovered leaf functions and thunks.
 pub fn discover(img: &Image) -> anyhow::Result<Vec<Func>> {
+    discover_with(img, &[])
+}
+
+/// [`discover`] with more function starts the caller knows of (targets a run found that no static pass can: pointers
+/// kept as image-relative offsets, say).
+pub fn discover_with(img: &Image, extra: &[u32]) -> anyhow::Result<Vec<Func>> {
     let mut known = img.functions()?;
     let pdata_n = known.len();
     // Targets of pdata functions: every instruction must be scanned once.
@@ -82,6 +88,7 @@ pub fn discover(img: &Image) -> anyhow::Result<Vec<Func>> {
         pending.extend(e.rva);
     }
     pending.push(img.info.entry_rva);
+    pending.extend(extra);
     if let Some(t) = &img.info.tls {
         pending.extend(&t.callback_rvas);
     }

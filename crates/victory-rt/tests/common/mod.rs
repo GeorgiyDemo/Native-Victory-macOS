@@ -203,3 +203,21 @@ fn lift_into(dir: &Path, pe: &[u8]) {
     std::fs::write(dir.join("rt.h"), victory_recomp::lift::RT_HEADER).unwrap();
     std::fs::write(dir.join("rt_host.c"), victory_recomp::RT_HOST_C).unwrap();
 }
+
+/// Lifts a PE that is already built (a DLL the test is pointed at, not part of the repository) into a unit dylib of its
+/// own, as [`build_unit`] does for a fixture.
+pub fn unit_of_pe(name: &str, file_name: &str, pe: &[u8]) -> PathBuf {
+    let dir = scratch(name);
+    std::fs::write(dir.join(file_name), pe).unwrap();
+    lift_into(&dir, pe);
+    std::fs::write(dir.join("rt_unit.c"), victory_recomp::RT_UNIT_C).unwrap();
+    let out = dir.join(format!("lib{name}.dylib"));
+    run(Command::new("clang")
+        .args(["-arch", "arm64", "-O2", "-ffp-contract=off", "-Wno-unused", "-dynamiclib", "-Wl,-undefined,dynamic_lookup", "-I"])
+        .arg(&dir)
+        .arg(dir.join("unit.c"))
+        .arg(dir.join("rt_unit.c"))
+        .arg("-o")
+        .arg(&out));
+    out
+}

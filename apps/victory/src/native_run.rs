@@ -63,7 +63,7 @@ impl ImportResolver for Recording<'_> {
 /// DLLs our runtime serves are never taken from the title's folder; any
 /// other the title ships is (the host has no C++ runtime to offer).
 fn title_dll(dll: &str) -> bool {
-    !victory_hle::registry().iter().any(|m| m.serves(dll))
+    !victory_hle::registry().iter().any(|m| m.serves(dll)) && crate::native_arch::has_unit(dll)
 }
 
 /// Binds and finalizes `image`, then prints what was bound (and, with
@@ -76,9 +76,8 @@ fn bind(
     list: bool,
 ) -> Result<BindReport> {
     let recording = Recording::new(resolver);
-    let report = native::bind_imports(image, &recording, policy)
+    let report = crate::native_arch::bind(image, &recording, policy)
         .with_context(|| format!("binding {name}"))?;
-    image.finalize()?;
     println!(
         "bound          {name}: {} hle, {} host, {} title, {} stubbed",
         report.hle,
@@ -187,6 +186,7 @@ fn load_late(
         let resolver = WithTitleDlls { inner: &hle };
         for d in &new {
             note(d);
+            crate::native_arch::attach(&d.name, &d.image)?;
             if d.image.tls().is_some() {
                 // Threads that already run have no block for it.
                 tracing::warn!(dll = d.name, "a DLL with static TLS loaded late");
@@ -221,8 +221,11 @@ pub fn run(
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    crate::native_arch::start()?;
     let image = NativeImage::map(&bytes, None)?;
     drop(bytes);
+    // The first image attached is the main one.
+    crate::native_arch::attach(&exe.file_name().unwrap_or_default().to_string_lossy(), &image)?;
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -251,6 +254,7 @@ pub fn run(
     let dlls = dll::map_title_dlls(image.info(), title_dir, &title_dll)?;
     for d in &dlls {
         note(d);
+        crate::native_arch::attach(&d.name, &d.image)?;
     }
     let chain = WithTitleDlls { inner: &resolver };
     for d in &dlls {
@@ -341,15 +345,7 @@ unsafe impl Send for Launch {}
 /// bridged ones (the title is Windows x64), the runtime's physical-memory pools feed the GPU's
 /// pool table, and fence events signal the title's event handles.
 fn connect_gpu() {
-    victory_gpu::object::set_bridge(victory_gpu::object::Bridge {
-        is_bridged: native::is_bridged,
-        copy_of: native::bridged_copy_of,
-        expose: |this, len, area| {
-            // SAFETY: forwarded: a live object of ours whose first word is such a table.
-            unsafe { native::expose_object(this, len, area) }
-        },
-        declare_win64: native::declare_win64,
-    });
+    victory_gpu::object::set_bridge(crate::native_arch::gpu_bridge());
     victory_hle::modules::xmem_physical::set_observer(Some(std::sync::Arc::new(PoolFeed(
         victory_gpu::native::pool_observer(),
     ))));

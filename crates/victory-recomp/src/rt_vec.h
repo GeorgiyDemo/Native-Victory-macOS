@@ -396,3 +396,70 @@ static inline X128 h_extrq(X128 d, unsigned len, unsigned idx) { len &= 63; idx 
 #define ldx32 o_ldx32
 #define ldx64 o_ldx64
 #endif
+
+/* dpps: products selected by imm[7:4], summed as (p0 + p1) + (p2 + p3), copied to the lanes imm[3:0] selects. */
+static inline X128 h_vdpps(X128 a, X128 b, int imm) {
+  float p[4]; X128 r;
+  for (int k = 0; k < 4; k++) p[k] = (imm >> (4 + k) & 1) ? a.f[k] * b.f[k] : 0.0f;
+  float s = (p[0] + p[1]) + (p[2] + p[3]);
+  LP(4) r.f[k] = (imm >> k & 1) ? s : 0.0f;
+  return r;
+}
+static inline X128 h_dppd(X128 a, X128 b, int imm) {
+  double p0 = (imm >> 4 & 1) ? a.g[0] * b.g[0] : 0.0, p1 = (imm >> 5 & 1) ? a.g[1] * b.g[1] : 0.0, s = p0 + p1; X128 r;
+  LP(2) r.g[k] = (imm >> k & 1) ? s : 0.0;
+  return r;
+}
+#define h_vdppd h_dppd
+
+/* CRC32C (the SSE4.2 crc32 instruction): `bytes` low bytes of v into crc. */
+static inline u32 h_crc32c(u32 crc, u64 v, int bytes) {
+  for (int k = 0; k < bytes; k++) {
+    crc ^= (u32)(v >> (8 * k)) & 0xff;
+    for (int b = 0; b < 8; b++) crc = (crc >> 1) ^ (0x82F63B78u & -(crc & 1));
+  }
+  return crc;
+}
+
+/* SSE4.2 pcmpistri/pcmpestri/pcmpistrm/pcmpestrm (SDM 4.1.x): la/lb are the explicit lengths, INT_MIN for implicit
+ * (up to the first zero element). Sets ZF/SF/CF/OF in f, the expanded or bit mask in *mk, returns the index. */
+static inline u32 h_pcmpstr(X128 a, X128 b, int la, int lb, int imm, Fl *f, X128 *mk) {
+  int n = (imm & 1) ? 8 : 16, sgn = (imm >> 1) & 1, agg = (imm >> 2) & 3;
+  s64 ea[16], eb[16];
+  for (int k = 0; k < n; k++) {
+    if (n == 16) { ea[k] = sgn ? (s64)a.sb[k] : (s64)a.b[k]; eb[k] = sgn ? (s64)b.sb[k] : (s64)b.b[k]; }
+    else { ea[k] = sgn ? (s64)a.sw[k] : (s64)a.w[k]; eb[k] = sgn ? (s64)b.sw[k] : (s64)b.w[k]; }
+  }
+  if (la == (-0x7fffffff - 1)) { la = 0; while (la < n && (n == 16 ? a.b[la] : a.w[la])) la++; }
+  else { if (la < 0) la = -la; if (la > n) la = n; }
+  if (lb == (-0x7fffffff - 1)) { lb = 0; while (lb < n && (n == 16 ? b.b[lb] : b.w[lb])) lb++; }
+  else { if (lb < 0) lb = -lb; if (lb > n) lb = n; }
+  unsigned res = 0;
+  for (int j = 0; j < n; j++) {
+    int bit = 0, bv = j < lb;
+    switch (agg) {
+    case 0: for (int i = 0; i < la && bv; i++) bit |= ea[i] == eb[j]; break;
+    case 1: for (int i = 0; i + 1 < la && bv; i += 2) bit |= eb[j] >= ea[i] && eb[j] <= ea[i + 1]; break;
+    case 2: bit = j < la && bv ? ea[j] == eb[j] : (j >= la && !bv); break;
+    default: {
+      bit = 1;
+      for (int k = 0; j + k < n; k++) {
+        int av = k < la, bvv = j + k < lb, eq;
+        if (!av) eq = 1; else if (!bvv) eq = 0; else eq = ea[k] == eb[j + k];
+        bit &= eq;
+      }
+    }
+    }
+    res |= (unsigned)bit << j;
+  }
+  unsigned full = (1u << n) - 1, valid = (1u << lb) - 1;
+  switch ((imm >> 4) & 3) { case 1: res = ~res & full; break; case 3: res = (res ^ valid) & full; break; default: break; }
+  f->k = FK_RAW;
+  f->c = (u64)(res != 0) | (u64)(lb < n) << 1 | (u64)(la < n) << 2 | (u64)(res & 1) << 3;
+  if (imm & 0x40) {
+    mk->q[0] = mk->q[1] = 0;
+    for (int j = 0; j < n; j++) if (res >> j & 1) { if (n == 16) mk->b[j] = 0xff; else mk->w[j] = 0xffff; }
+  } else { mk->q[0] = res; mk->q[1] = 0; }
+  if (!res) return n;
+  return (imm & 0x40) ? 31 - __builtin_clz(res) : __builtin_ctz(res);
+}

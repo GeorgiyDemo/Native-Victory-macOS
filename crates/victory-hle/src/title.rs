@@ -208,6 +208,9 @@ pub mod arm64 {
         for (i, x) in xmm.iter_mut().enumerate() {
             *x = *ctx.xmm(i);
         }
+        if std::env::var_os("VICTORY_TRACE_RESUME").is_some() {
+            eprintln!("resume rip {:#x} ret {:#x} rsp {:#x}", ctx.rip, ret, ctx.gpr[4]);
+        }
         // SAFETY: an unwound context at a landing pad, per the loader.
         unsafe { victory_rt::resume(&ctx.gpr, &xmm, ctx.rip, ret) }
     }
@@ -323,6 +326,11 @@ pub mod arm64 {
     /// the life of the process: the same stub for every caller. The signature is the one recorded for the
     /// address ([`abi::sig_of`]), else the one a method owner noted, else eight integers.
     pub fn stub_for(address: usize) -> Option<usize> {
+        stub_named(address, None)
+    }
+
+    /// [`stub_for`], the thunk named `name` (what `RT_TRACE_IMPORTS` prints) when this call makes it.
+    fn stub_named(address: usize, name: Option<String>) -> Option<usize> {
         // Nothing to hand it to (unit tests of the runtime call functions directly).
         if !victory_rt::is_loaded() {
             return Some(address);
@@ -332,7 +340,7 @@ pub mod arm64 {
             return Some(t);
         }
         let sig = known_sig(address).unwrap_or(DEFAULT_SIG);
-        let name = format!("host@{address:#x}");
+        let name = name.unwrap_or_else(|| format!("host@{address:#x}"));
         let binding = if lock(&RAW).get_or_insert_default().contains(&address) {
             // SAFETY: registered by `raw_export` as a function of the lifted `Cpu`.
             victory_rt::Binding::Raw(unsafe {
@@ -453,7 +461,7 @@ pub mod arm64 {
                             Provenance::Hle => report.hle += 1,
                             _ => report.host += 1,
                         }
-                        stub_for(address).ok_or_else(|| {
+                        stub_named(address, Some(format!("{}!{}", module.dll, entry.symbol))).ok_or_else(|| {
                             anyhow::anyhow!("no thunk for {}!{}", module.dll, entry.symbol)
                         })?
                     }

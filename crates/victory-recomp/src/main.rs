@@ -42,8 +42,16 @@ fn main() -> Result<()> {
         "lift-split" => {
             let dir = std::path::PathBuf::from(args.get(3).context(USAGE)?);
             let per: usize = args.get(4).context(USAGE)?.parse()?;
+            // Optional file of extra function starts, one RVA per line (hex with 0x).
+            let extra: Vec<u32> = match args.get(5) {
+                Some(f) => std::fs::read_to_string(f)?
+                    .lines()
+                    .filter_map(|l| u32::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok())
+                    .collect(),
+                None => vec![],
+            };
             let t = std::time::Instant::now();
-            let (n, ok, stub, units) = victory_recomp::lift_image_split(&img, &dir, per)?;
+            let (n, ok, stub, units) = victory_recomp::lift_image_split(&img, &dir, per, &extra)?;
             eprintln!(
                 "{n} functions, {ok} lifted, {stub} stubbed, {units} units in {:.1}s",
                 t.elapsed().as_secs_f64()

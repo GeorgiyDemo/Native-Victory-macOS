@@ -115,6 +115,12 @@ pub fn lift_image(img: &Image) -> Result<lift::Unit> {
     ))
 }
 
+fn unit_name(ext: bool, n_old: &mut usize, n_new: &mut usize) -> String {
+    let n = if ext { n_new } else { n_old };
+    *n += 1;
+    if ext { format!("tu_x{:04}", *n - 1) } else { format!("tu_{:05}", *n - 1) }
+}
+
 /// Largest amount of x86 code (bytes) one split unit may hold.
 pub const UNIT_BYTES: usize = 600_000;
 
@@ -124,9 +130,17 @@ pub fn lift_image_split(
     img: &Image,
     dir: &std::path::Path,
     per_unit: usize,
+    extra: &[u32],
 ) -> Result<(usize, usize, usize, usize)> {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let funcs = group_chained(img, discover::discover(img)?);
+    let funcs = group_chained(img, discover::discover_with(img, extra)?);
+    // Functions only the extra seeds found go into units of their own (`tu_x*.c`), so adding seeds to a built title
+    // does not move the others between units.
+    let plain: HashSet<u32> = if extra.is_empty() {
+        HashSet::new()
+    } else {
+        group_chained(img, discover::discover(img)?).iter().map(|(f, _)| f.begin).collect()
+    };
     let base = img.info.image_base;
     let starts: HashSet<u64> = funcs.iter().map(|(f, _)| base + f.begin as u64).collect();
     let is_func = |va: u64| starts.contains(&va);
@@ -147,18 +161,22 @@ pub fn lift_image_split(
     std::fs::write(dir.join("table.c"), lift::table_unit(base, &all, &pads))?;
     // Units are `per_unit` functions, further cut so no unit holds more than UNIT_BYTES of x86 code
     // (a few giant functions would otherwise make one unit take far longer than the rest).
-    let mut chunks: Vec<&[(Func, Vec<Func>)]> = vec![];
-    for part in funcs.chunks(per_unit) {
+    let (old, new): (Vec<_>, Vec<_>) = funcs.iter().cloned().partition(|(f, _)| extra.is_empty() || plain.contains(&f.begin));
+    let mut chunks: Vec<(String, &[(Func, Vec<Func>)])> = vec![];
+    let (mut n_old, mut n_new) = (0, 0);
+    for (list, ext) in [(&old, false), (&new, true)] {
+    for part in list.chunks(per_unit) {
         let (mut from, mut bytes) = (0, 0usize);
         for (i, (f, parts)) in part.iter().enumerate() {
             let sz = (f.end - f.begin) as usize + parts.iter().map(|p| (p.end - p.begin) as usize).sum::<usize>();
             if i > from && bytes + sz > UNIT_BYTES {
-                chunks.push(&part[from..i]);
+                chunks.push((unit_name(ext, &mut n_old, &mut n_new), &part[from..i]));
                 (from, bytes) = (i, 0);
             }
             bytes += sz;
         }
-        chunks.push(&part[from..]);
+        chunks.push((unit_name(ext, &mut n_old, &mut n_new), &part[from..]));
+    }
     }
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let (next, lifted, stubbed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
@@ -168,7 +186,7 @@ pub fn lift_image_split(
                 sc.spawn(|| -> Result<()> {
                     loop {
                         let n = next.fetch_add(1, Relaxed);
-                        let Some(part) = chunks.get(n) else {
+                        let Some((name, part)) = chunks.get(n) else {
                             return Ok(());
                         };
                         let decoded: Vec<_> = part
@@ -193,7 +211,7 @@ pub fn lift_image_split(
                         let u = lift::lift_part(&ctx, &fins);
                         lifted.fetch_add(u.lifted.len(), Relaxed);
                         stubbed.fetch_add(u.failed.len(), Relaxed);
-                        std::fs::write(dir.join(format!("tu_{n:05}.c")), u.c)?;
+                        std::fs::write(dir.join(format!("{name}.c")), u.c)?;
                     }
                 })
             })

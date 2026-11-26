@@ -74,41 +74,60 @@ pub fn find_jump_tables_with(
             continue;
         }
         let win = &ins[n.saturating_sub(40)..n];
-        // The table base register: a rip-relative lea in the window.
-        let Some(lea) = win
-            .iter()
-            .rev()
-            .find(|i| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand())
-        else {
-            continue;
-        };
-        let lea_rva = (lea.ip_rel_memory_address().wrapping_sub(base)) as u32;
-        let base_reg = lea.op0_register();
-        // The scaled load from the table.
-        let Some(ld) = win.iter().rev().find(|i| {
-            is_cmov_free_load(i.code())
-                && i.op1_kind() == OpKind::Memory
-                && i.memory_base() == base_reg
-                && i.memory_index_scale() == 4
+        // The scaled load from the table, then the rip-relative `lea` of its base register: close by in compiler
+        // switches, but MSVC's memmove loads `__ImageBase` once at the entry for all its tables.
+        let Some((ld, lea)) = win.iter().rev().find_map(|ld| {
+            if !(is_cmov_free_load(ld.code())
+                && ld.op1_kind() == OpKind::Memory
+                && ld.memory_index_scale() == 4)
+            {
+                return None;
+            }
+            let base_reg = ld.memory_base();
+            ins[..n]
+                .iter()
+                .rev()
+                .find(|i| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.op0_register() == base_reg)
+                .map(|lea| (ld, lea))
         }) else {
             continue;
         };
+        let lea_rva = (lea.ip_rel_memory_address().wrapping_sub(base)) as u32;
         let table_rva = lea_rva.wrapping_add(ld.memory_displacement64() as u32);
         // Bound from `cmp idx, N` / `ja default` when present.
-        let bound = win
-            .iter()
-            .rev()
-            .find(|i| {
-                matches!(
-                    i.code(),
-                    Code::Cmp_rm32_imm8
-                        | Code::Cmp_rm32_imm32
-                        | Code::Cmp_rm64_imm8
-                        | Code::Cmp_rm64_imm32
-                        | Code::Cmp_rm8_imm8
-                )
+        let is_cmp = |i: &Instruction| {
+            matches!(
+                i.code(),
+                Code::Cmp_rm32_imm8
+                    | Code::Cmp_rm32_imm32
+                    | Code::Cmp_rm64_imm8
+                    | Code::Cmp_rm64_imm32
+                    | Code::Cmp_rm8_imm8
+                    | Code::Cmp_rm16_imm8
+                    | Code::Cmp_rm16_imm16
+                    | Code::Cmp_AL_imm8
+                    | Code::Cmp_AX_imm16
+                    | Code::Cmp_EAX_imm32
+                    | Code::Cmp_RAX_imm32
+            )
+        };
+        let ja_after = |k: usize| {
+            win.get(k + 1)
+                .is_some_and(|j| matches!(j.code(), Code::Ja_rel8_64 | Code::Ja_rel32_64 | Code::Jae_rel8_64 | Code::Jae_rel32_64))
+        };
+        // The compare the range check `ja default` follows. With none, the table runs as far as its entries land
+        // inside the function (a compare of something else would cut a real table short, and a missing entry is a
+        // trap at run time, where an extra one is only a label).
+        let pick = (0..win.len()).rev().find(|&k| is_cmp(&win[k]) && ja_after(k));
+        let bound = pick
+            .map(|k| {
+                let c = &win[k];
+                let v = match c.code() {
+                    Code::Cmp_AL_imm8 | Code::Cmp_rm8_imm8 => c.immediate(1) as u8 as usize,
+                    _ => c.immediate(1) as usize,
+                };
+                v + usize::from(!matches!(win.get(k + 1).map(|j| j.code()), Some(Code::Jae_rel8_64 | Code::Jae_rel32_64)))
             })
-            .map(|i| i.immediate(1) as usize + 1)
             .filter(|b| (1..=65536).contains(b));
         let mut targets = vec![];
         for k in 0..bound.unwrap_or(4096) {

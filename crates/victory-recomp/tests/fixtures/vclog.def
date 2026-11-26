@@ -1,0 +1,5 @@
+LIBRARY vclog.dll
+EXPORTS
+vc_log
+vc_log_get
+vc_log_reset

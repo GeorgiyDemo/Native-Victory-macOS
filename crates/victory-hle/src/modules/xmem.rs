@@ -88,6 +88,9 @@ pub(super) fn address_range(flags: u64) -> (usize, usize) {
     let bits = match (flags & ADDRESS_32BIT, flags >> 12 & 7) {
         (0, 0) => 40,
         (0, field) => 47 - field,
+        // An arm64 macOS process cannot map below 4 GiB (its `__PAGEZERO` is that size and the kernel insists): the
+        // request is served from above, and a title that keeps the address in 32 bits fails where it truncates it.
+        _ if cfg!(all(target_os = "macos", target_arch = "aarch64")) => return (1 << 32, (1 << 40) - 1),
         _ => return (0, u32::MAX as usize),
     };
     (1 << 32, (1 << bits) - 1)
@@ -550,7 +553,8 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         // A macOS host reaches the low 4 GiB only if its executable is linked
         // without the 4 GiB `__PAGEZERO` (`-pagezero_size`), which tests are not.
-        if cfg!(windows) || !p.is_null() {
+        // (an arm64 macOS process cannot reach it at all: the request is served from above 4 GiB)
+        if cfg!(windows) || (!p.is_null() && (p as usize) < 1 << 32) {
             assert!(!p.is_null() && (p as usize) < 1 << 32);
             XMemFree(p, ALLOC_32BIT);
         }

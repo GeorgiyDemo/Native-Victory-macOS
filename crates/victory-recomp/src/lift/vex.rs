@@ -196,7 +196,7 @@ impl L<'_> {
             }
             // ---- three operands plus an immediate ----
             M::Vshufps | M::Vpalignr | M::Vcmpps | M::Vcmppd | M::Vpblendw | M::Vblendps
-            | M::Vpblendd | M::Vblendpd | M::Vshufpd | M::Vpclmulqdq => {
+            | M::Vpblendd | M::Vblendpd | M::Vshufpd | M::Vpclmulqdq | M::Vdpps => {
                 let v = imm();
                 let (helper, lo, hi) = match m {
                     M::Vblendps | M::Vpblendd => ("h_vblendps".to_string(), v & 15, v >> 4),

@@ -63,6 +63,8 @@ struct RtImport {
     fmask: u16,
     smask: u16,
     ret: u8,
+    bmask: u16,
+    hmask: u16,
 }
 
 /// How an import is called.
@@ -82,16 +84,18 @@ pub struct Import {
     pub binding: Binding,
 }
 
-fn parse_sig(sig: &str) -> Result<(u8, u16, u16, u8)> {
+fn parse_sig(sig: &str) -> Result<(u8, u16, u16, u8, u16, u16)> {
     let (args, ret) = sig
         .split_once('>')
         .with_context(|| format!("signature {sig:?} has no `>`"))?;
-    let (mut fmask, mut smask) = (0u16, 0u16);
+    let (mut fmask, mut smask, mut bmask, mut hmask) = (0u16, 0u16, 0u16, 0u16);
     for (i, c) in args.chars().enumerate() {
         match c {
             'i' => {}
             'd' => fmask |= 1 << i,
             'f' => smask |= 1 << i,
+            'b' => bmask |= 1 << i,
+            'h' => hmask |= 1 << i,
             _ => bail!("bad argument letter {c:?} in {sig:?}"),
         }
     }
@@ -103,7 +107,7 @@ fn parse_sig(sig: &str) -> Result<(u8, u16, u16, u8)> {
         "v" => 4,
         _ => bail!("bad result {ret:?} in {sig:?}"),
     };
-    Ok((args.len() as u8, fmask, smask, ret))
+    Ok((args.len() as u8, fmask, smask, ret, bmask, hmask))
 }
 
 /// Entry points of the runtime inside the dylib.
@@ -200,7 +204,7 @@ pub fn import_thunk(name: &str, binding: Binding) -> Result<u64> {
     let cname = CString::new(name)?;
     let (func, raw, sig) = match binding {
         Binding::Typed(f, s) => (f, None, parse_sig(s)?),
-        Binding::Raw(f) => (std::ptr::null(), Some(f), (0, 0, 0, 4)),
+        Binding::Raw(f) => (std::ptr::null(), Some(f), (0, 0, 0, 4, 0, 0)),
     };
     let desc = RtImport {
         name: cname.as_ptr(),
@@ -210,6 +214,8 @@ pub fn import_thunk(name: &str, binding: Binding) -> Result<u64> {
         fmask: sig.1,
         smask: sig.2,
         ret: sig.3,
+        bmask: sig.4,
+        hmask: sig.5,
     };
     // SAFETY: desc is valid for the call; the runtime copies it and the name.
     Ok(unsafe { (rt.bind)(&desc) })

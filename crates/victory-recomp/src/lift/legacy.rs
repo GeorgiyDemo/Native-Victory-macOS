@@ -91,6 +91,10 @@ const BIN: &[&str] = &[
     "Addsubpd",
     "Movlhps",
     "Movhlps",
+    "Minps",
+    "Minpd",
+    "Maxps",
+    "Maxpd",
     "Aesenc",
     "Aesenclast",
     "Aesdec",
@@ -105,9 +109,13 @@ const BIN_IMM: &[&str] = &[
     "Shufps",
     "Shufpd",
     "Pclmulqdq",
+    "Cmpps",
+    "Cmppd",
+    "Dpps",
+    "Dppd",
 ];
 /// `dst = h_v<name>(src)`.
-const UN: &[&str] = &["Pabsb", "Pabsw", "Pabsd", "Phminposuw", "Aesimc"];
+const UN: &[&str] = &["Pabsb", "Pabsw", "Pabsd", "Phminposuw", "Aesimc", "Cvtdq2ps", "Cvttps2dq", "Cvtps2dq"];
 /// `dst = h_v<name>(src, imm)`.
 const UN_IMM: &[&str] = &["Pshufd", "Pshufhw", "Pshuflw", "Aeskeygenassist"];
 /// `dst = h_v<name>(dst, count)`; the count is an immediate or an xmm/m128 low qword.
@@ -268,6 +276,52 @@ impl L<'_> {
                     ));
                 }
             }
+            // Scalar compare with a predicate; the string instruction of the same name has no xmm operand.
+            M::Cmpss | M::Cmpsd if i.op_count() == 3 => {
+                let dbl = m == M::Cmpsd;
+                let d = Self::xdst(i)?;
+                let s = self.xscalar(i, 1, dbl)?;
+                let p = i.immediate(2) as u8 & 7;
+                if dbl {
+                    self.emit(&format!("x{d}.q[0] = cmp_pred(x{d}.g[0], {s}, {p}) ? ~0ull : 0;"));
+                } else {
+                    self.emit(&format!("x{d}.d[0] = cmp_pred(x{d}.f[0], {s}, {p}) ? ~0u : 0;"));
+                }
+            }
+            M::Ptest => {
+                let (d, s) = (Self::xdst(i)?, self.x128(i, 1)?);
+                self.emit(&format!(
+                    "{{ X128 pa = x{d}, pb = {s}; fl_set_test(&F, !h_pt_and(pa, pb, ~0ull), !h_pt_andn(pa, pb, ~0ull)); }}"
+                ));
+            }
+            // SSE4.2 string compare: the helper sets the flags and the mask, returns the index.
+            M::Pcmpistri | M::Pcmpestri | M::Pcmpistrm | M::Pcmpestrm => {
+                let (d, s) = (Self::xdst(i)?, self.x128(i, 1)?);
+                let imm = i.immediate(2) as u8;
+                let explicit = matches!(m, M::Pcmpestri | M::Pcmpestrm);
+                let (la, lb) = if explicit { ("(s32)r0", "(s32)r2") } else { ("(-0x7fffffff-1)", "(-0x7fffffff-1)") };
+                let out = if matches!(m, M::Pcmpistri | M::Pcmpestri) { "r1 = ix;" } else { "x0 = mk;" };
+                self.emit(&format!(
+                    "{{ X128 mk; u32 ix = h_pcmpstr(x{d}, {s}, {la}, {lb}, {imm}, &F, &mk); {out} }}"
+                ));
+            }
+            M::Crc32 => {
+                let bits = Self::bits0(i)?;
+                let sb = match i.op1_kind() {
+                    OpKind::Register => i.op1_register().size() as u32 * 8,
+                    _ => i.memory_size().size() as u32 * 8,
+                };
+                let (d, s) = (self.rd(i, 0, bits)?, self.rd(i, 1, sb)?);
+                let w = self.wr(i, 0, &format!("h_crc32c((u32)({d}), {s}, {})", sb / 8))?;
+                self.emit(&w);
+            }
+            // Control-flow shadow stack and the x87 control word: no CET, default x87 state.
+            M::Rdsspq | M::Rdsspd => {}
+            M::Fnstcw => {
+                let a = self.addr(i)?;
+                self.emit(&format!("st16({a}, 0x37f);"));
+            }
+            M::Fldcw | M::Wait | M::Fninit | M::Fnclex => {}
             // ---- odd system instructions ----
             M::Int | M::Int1 => {
                 let n = if m == M::Int { i.immediate(0) as u8 } else { 1 };

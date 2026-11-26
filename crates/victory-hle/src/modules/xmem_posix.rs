@@ -37,7 +37,6 @@ fn reservations() -> MutexGuard<'static, BTreeMap<usize, usize>> {
 
 fn track(base: usize, len: usize) {
     reservations().insert(base, len);
-    #[cfg(target_arch = "x86_64")]
     crate::host_posix::adopt_region(base, len);
 }
 
@@ -47,7 +46,6 @@ pub(super) fn release_reservation(base: usize) {
     let Some(len) = reservations().remove(&base) else {
         return;
     };
-    #[cfg(target_arch = "x86_64")]
     crate::host_posix::forget_region(base);
     super::xmem_physical::release_pool_backing(base, len);
     // SAFETY: a reservation we made and no longer track.

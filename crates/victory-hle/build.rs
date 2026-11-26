@@ -83,6 +83,17 @@ fn float_letter(ty: &str, aliases: &HashMap<String, String>) -> Option<char> {
     }
 }
 
+/// 8- and 16-bit integer parameters: Apple's arm64 ABI lets the callee assume the caller extended them.
+fn narrow_letter(ty: &str, aliases: &HashMap<String, String>) -> char {
+    let ty = ty.trim();
+    let ty = aliases.get(ty).map_or(ty, String::as_str);
+    match ty {
+        "u8" | "i8" | "bool" => 'b',
+        "u16" | "i16" => 'h',
+        _ => 'i',
+    }
+}
+
 fn result_letter(ty: &str, aliases: &HashMap<String, String>) -> char {
     let ty = ty.trim();
     let ty = aliases.get(ty).map_or(ty, String::as_str);
@@ -293,7 +304,7 @@ fn main() {
             for param in split_top(params) {
                 // `name: Type`; a pattern with a colon in a path (`std::x`) cannot be a parameter name.
                 let ty = param.split_once(':').map_or(param, |(_, t)| t);
-                sig.push(float_letter(ty, &aliases).unwrap_or('i'));
+                sig.push(float_letter(ty, &aliases).unwrap_or_else(|| narrow_letter(ty, &aliases)));
             }
             sig.push('>');
             sig.push(result_letter(ret, &aliases));
