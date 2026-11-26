@@ -170,9 +170,13 @@ pub fn import_thunk(name: &str, binding: Binding) -> Result<u64> {
 
 /// Gives the calling thread its TEB and guest stack (`stack_lo..stack_hi`): what `gs:` reads in lifted code.
 /// A thread that never calls it gets a private TEB on its first guest call. Needs a loaded host.
-pub fn thread_init(teb: *mut u8, stack_lo: *mut u8, stack_hi: *mut u8) {
+///
+/// # Safety
+/// `teb` is a TEB block (self pointer at 0x30) and `stack_lo..stack_hi` a stack, both outliving the thread's
+/// guest calls.
+pub unsafe fn thread_init(teb: *mut u8, stack_lo: *mut u8, stack_hi: *mut u8) {
     let rt = RT.get().expect("no host loaded");
-    // SAFETY: the caller's TEB and stack outlive the thread's guest calls.
+    // SAFETY: forwarded.
     unsafe { (rt.thread_init)(teb, stack_lo, stack_hi) };
 }
 

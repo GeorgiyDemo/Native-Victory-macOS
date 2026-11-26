@@ -634,11 +634,11 @@ pub extern "system" fn GetLogicalProcessorInformation(out: *mut u8, length: *mut
 }
 
 pub extern "system" fn IsProcessorFeaturePresent(feature: u32) -> i32 {
-    // SSE and later, RDTSC, NX, cmpxchg16b, XSAVE, AVX2, RDRAND: the console's CPU has them.
+    // SSE and later, RDTSC, NX, cmpxchg16b, XSAVE, AVX, AVX2, RDRAND: the console's CPU has them.
     // Not `__fastfail` (23): a failure then goes through `abort`, which we log.
     i32::from(matches!(
         feature,
-        6 | 8 | 10 | 12 | 13 | 14 | 17 | 28 | 36 | 37 | 38
+        6 | 8 | 10 | 12 | 13 | 14 | 17 | 28 | 36 | 37 | 38 | 39 | 40
     ))
 }
 
@@ -2107,6 +2107,18 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_consoles_cpu_has_avx_and_avx2() {
+        use super::IsProcessorFeaturePresent as present;
+        // PF_AVX_INSTRUCTIONS_AVAILABLE, PF_AVX2_INSTRUCTIONS_AVAILABLE, with the SSE levels they build on.
+        for feature in [6, 10, 13, 36, 37, 38, 39, 40] {
+            assert_eq!(present(feature), 1, "feature {feature}");
+        }
+        // AVX-512 (41) and the ARM codes are not.
+        assert_eq!(present(41), 0);
+        assert_eq!(present(29), 0);
+    }
+
     use super::*;
 
     #[test]

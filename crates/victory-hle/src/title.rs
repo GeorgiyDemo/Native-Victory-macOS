@@ -109,7 +109,8 @@ pub mod arm64 {
                 block.add(teb::OFF_STACK_LIMIT).cast::<usize>().read(),
             )
         };
-        victory_rt::thread_init(block, lo as *mut u8, hi as *mut u8);
+        // SAFETY: the loader's TEB and its leaked guest stack live as long as the thread.
+        unsafe { victory_rt::thread_init(block, lo as *mut u8, hi as *mut u8) };
         ATTACHED.set(true);
     }
 
@@ -168,6 +169,40 @@ pub mod arm64 {
         };
         lock(&THUNKS).get_or_insert_default().insert(address, thunk);
         Some(thunk)
+    }
+
+    /// The imports of a title image as `victory_rt::Host::load` takes them: each (DLL, name) resolved as
+    /// the Rosetta host's binder does (`HleResolver`: our registry, then the POSIX host), bound to the
+    /// function's address and its signature string. With the names nobody serves, as `dll!name`. Imports
+    /// by ordinal are reported unserved (the runtime binds by name).
+    pub fn rt_imports<'a>(
+        resolver: &crate::HleResolver,
+        modules: impl IntoIterator<Item = &'a victory_pe::ImportModule>,
+    ) -> (Vec<victory_rt::Import>, Vec<String>) {
+        use victory_loader::{ImportResolver, Resolution};
+        let (mut found, mut missing) = (Vec::<victory_rt::Import>::new(), vec![]);
+        for module in modules {
+            for entry in &module.entries {
+                let victory_pe::ImportSymbol::Name { name, .. } = &entry.symbol else {
+                    missing.push(format!("{}!{}", module.dll, entry.symbol));
+                    continue;
+                };
+                if found.iter().any(|i| i.name == name) {
+                    continue;
+                }
+                match resolver.resolve(&module.dll, &entry.symbol) {
+                    Resolution::Found { address, .. } => found.push(victory_rt::Import {
+                        name: Box::leak(name.clone().into_boxed_str()),
+                        binding: victory_rt::Binding::Typed(
+                            address as *const _,
+                            known_sig(address).unwrap_or(DEFAULT_SIG),
+                        ),
+                    }),
+                    Resolution::Missing => missing.push(format!("{}!{name}", module.dll)),
+                }
+            }
+        }
+        (found, missing)
     }
 
     /// Entry points for host functions the title calls through pointers it was handed (the methods of a

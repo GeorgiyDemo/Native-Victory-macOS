@@ -932,6 +932,8 @@ name = "victory-rt"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "victory-hle",
+ "victory-loader",
  "victory-pe",
  "victory-recomp",
 ]
