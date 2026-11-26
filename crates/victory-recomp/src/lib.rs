@@ -140,7 +140,11 @@ pub fn lift_image_split(
     std::fs::write(dir.join("rt_unit.c"), RT_UNIT_C)?;
     let mut all: Vec<u64> = starts.iter().copied().collect();
     all.sort_unstable();
-    std::fs::write(dir.join("table.c"), lift::table_unit(base, &all))?;
+    let pads: Vec<(u64, u64)> = funcs
+        .iter()
+        .flat_map(|(f, _)| landing_pads(img, f).into_iter().map(move |p| (base + f.begin as u64, p)))
+        .collect();
+    std::fs::write(dir.join("table.c"), lift::table_unit(base, &all, &pads))?;
     // Units are `per_unit` functions, further cut so no unit holds more than UNIT_BYTES of x86 code
     // (a few giant functions would otherwise make one unit take far longer than the rest).
     let mut chunks: Vec<&[(Func, Vec<Func>)]> = vec![];

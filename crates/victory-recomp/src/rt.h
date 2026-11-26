@@ -72,14 +72,30 @@ u64 rt_call_guest(u64 target, const u64 *args, u32 n, u32 fmask, u64 *xmm0);
  * pad the host calls rt_resume with the unwound registers: it finds the frame, loads the registers into its Cpu, sets
  * rt_resume_va and longjmps; the wrapper then runs the body again with resume set, which jumps to the pad. */
 typedef struct RtFrame {
-  jmp_buf jb; struct RtFrame *prev; Cpu *c; u64 entry_rsp; Cpu *cur; const void *cur_imp;
+  jmp_buf jb; struct RtFrame *prev; Cpu *c; u64 entry_rsp; Cpu *cur; const void *cur_imp; const void *cb;
 } RtFrame;
 extern __thread u64 rt_resume_va;
 void rt_frame_enter(RtFrame *fr, Cpu *c);
 void rt_frame_leave(RtFrame *fr);
 /* Continues at the landing pad `rip` of the innermost frame whose entry rsp is above gpr[4], with the registers of
  * a Windows CONTEXT (rax rcx rdx rbx rsp rbp rsi rdi r8..r15; xmm0..15). Does not return. */
-void rt_resume(const u64 *gpr, const X128 *xmm, u64 rip) __attribute__((noreturn));
+void rt_resume(const u64 *gpr, const X128 *xmm, u64 rip, u64 ret) __attribute__((noreturn));
+/* `rip` is a landing pad or resume point inside the frame's function (the wrapper runs the body again with `resume`
+ * set), or the start of a function: then the frame's function "calls" it, with `ret` as the return address, on the
+ * frame's stack as the registers leave it (what RtlUnwindEx to a TargetIp that is a function does). */
+extern __thread u64 rt_resume_ret_va;
+extern __thread int rt_resume_call;
+void rt_resume_enter(Cpu *c) __attribute__((noreturn));
+/* An integer divide error (#DE) in lifted code: the registers are spilled and `ip` is the guest address of the
+ * instruction. Raises EXCEPTION_INT_DIVIDE_BY_ZERO (or EXCEPTION_INT_OVERFLOW when the divisor was not zero) through the
+ * fault hook; without a hook it traps. A handler that continues execution re-runs the instruction. */
+void rt_de(Cpu *c, u64 ip, int overflow) __attribute__((noreturn));
+#define RT_DE(ip, ovf) do { SPILL(); rt_de(c, (ip) - IMAGE_BASE + (u64)IMG, (ovf)); } while (0)
+/* The guest frame that called a host function which called back into the guest (rt_call_guest): an unwind that
+ * reaches the callback's bottom (a zero return address at `slot`) continues in the frame that made the host call,
+ * with the registers it had then. Fills `regs` and the return address and stack pointer after that call; 0 if the
+ * callback was not made from guest code. */
+int rt_callback_context(u64 slot, Cpu *regs, u64 *rip, u64 *rsp);
 /* A fault in lifted code: what the signal handler saw, and the thread's Cpu (the state at its last spill). */
 typedef struct { u32 signo, code, esr; u64 pc, addr; Cpu *run; } RtFault;
 typedef void (*RtFaultHook)(const RtFault *);
@@ -283,7 +299,8 @@ static inline s32 cvtt32(double v) { return (v != v || v >= 2147483648.0 || v <=
        x8=c->x[8],x9=c->x[9],x10=c->x[10],x11=c->x[11],x12=c->x[12],x13=c->x[13],x14=c->x[14],x15=c->x[15]; \
   Fl F = {0}; (void)F
 
-typedef struct { u32 rva; RtFn fn; } RtEntry;
+/* `pad`: a landing pad of some function (a jump to it resumes in that function's frame), not a function start. */
+typedef struct { u32 rva; RtFn fn; u32 pad; } RtEntry;
 extern const RtEntry rt_table[];
 extern const unsigned rt_table_n;
 /* A lifted image built as a dylib of its own (rt_unit.c, beside the generated tables) hands the runtime this: the

@@ -66,10 +66,10 @@ void rt_init(u8 *img, u64 size) {
 }
 #endif
 
-static inline RtFn lookup(const RtImg *m, u32 rva) {
+static inline const RtEntry *lookup(const RtImg *m, u32 rva) {
   u32 mask = (1u << (32 - m->shift)) - 1;
   for (u32 h = hash_of(m, rva); m->hash[h]; h = (h + 1) & mask)
-    if (m->tab[m->hash[h] - 1].rva == rva) return m->tab[m->hash[h] - 1].fn;
+    if (m->tab[m->hash[h] - 1].rva == rva) return &m->tab[m->hash[h] - 1];
   return 0;
 }
 
@@ -168,8 +168,8 @@ void rt_dispatch(Cpu *c, u64 target) {
     const RtImg *m = &images[i];
     u64 rva = target - (u64)m->base;
     if (__builtin_expect(rva < m->size, 1)) {
-      RtFn f = lookup(m, (u32)rva);
-      if (__builtin_expect(f != 0, 1)) { f(c); return; }
+      const RtEntry *e = lookup(m, (u32)rva);
+      if (__builtin_expect(e != 0, 1)) { e->fn(c); return; }
       rt_unresolved(c, target);
       return;
     }
@@ -199,6 +199,23 @@ static void thread_defaults(void) {
   }
 }
 
+/* One per rt_call_guest in progress on this thread: where its fake return address is, and the Cpu of the host call it was
+ * made from (null at the bottom). An unwind that gets to the bottom of a callback continues in that guest frame. */
+typedef struct RtCb { struct RtCb *prev; u64 slot; Cpu *host; } RtCb;
+static __thread RtCb *rt_cb_top;
+
+int rt_callback_context(u64 slot, Cpu *regs, u64 *rip, u64 *rsp) {
+  for (RtCb *cb = rt_cb_top; cb; cb = cb->prev) {
+    if (cb->slot != slot) continue;
+    if (!cb->host) return 0;
+    *regs = *cb->host;
+    *rip = ld64((u8 *)cb->host->r[4]);
+    *rsp = cb->host->r[4] + 8;
+    return 1;
+  }
+  return 0;
+}
+
 u64 rt_call_guest(u64 target, const u64 *args, u32 n, u32 fmask, u64 *xmm0) {
   static const u8 reg[4] = { 1, 2, 8, 9 };
   thread_defaults();
@@ -218,9 +235,12 @@ u64 rt_call_guest(u64 target, const u64 *args, u32 n, u32 fmask, u64 *xmm0) {
   }
   c.r[4] = sp;
   Cpu *saved = rt_cur, *saved_run = rt_run;
+  RtCb cb = { rt_cb_top, sp, saved };
+  rt_cb_top = &cb;
   rt_cur = 0; rt_run = &c; /* the callee is the new innermost frame; an import it calls sets rt_cur itself */
   rt_dispatch(&c, target);
   rt_cur = saved; rt_run = saved_run;
+  rt_cb_top = cb.prev;
   if (xmm0) *xmm0 = c.x[0].q[0];
   return c.r[0];
 }
@@ -274,14 +294,25 @@ u64 rt_rdtsc(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 /* ---- exceptions: frames, resuming at a landing pad, faults in lifted code ---- */
 static __thread RtFrame *rt_frames;
 __thread u64 rt_resume_va;
+__thread u64 rt_resume_ret_va;
+__thread int rt_resume_call;
 
 void rt_frame_enter(RtFrame *fr, Cpu *c) {
-  fr->prev = rt_frames; fr->c = c; fr->entry_rsp = c->r[4]; fr->cur = rt_cur; fr->cur_imp = rt_cur_imp;
+  fr->prev = rt_frames; fr->c = c; fr->entry_rsp = c->r[4]; fr->cur = rt_cur; fr->cur_imp = rt_cur_imp; fr->cb = rt_cb_top;
   rt_frames = fr;
 }
 void rt_frame_leave(RtFrame *fr) { rt_frames = fr->prev; }
 
-void rt_resume(const u64 *gpr, const X128 *xmm, u64 rip) {
+/* Is `va` the start of a lifted function (not a landing pad)? */
+static int is_function_start(u64 va) {
+  for (unsigned i = 0, n = __atomic_load_n(&n_images, __ATOMIC_ACQUIRE); i < n; i++) {
+    const RtImg *m = &images[i];
+    if (va - (u64)m->base < m->size) { const RtEntry *e = lookup(m, (u32)(va - (u64)m->base)); return e && !e->pad; }
+  }
+  return 0;
+}
+
+void rt_resume(const u64 *gpr, const X128 *xmm, u64 rip, u64 ret) {
   /* Frames of deeper functions have their entry rsp at or below the unwound rsp; the target is the first above. */
   RtFrame *fr = rt_frames;
   while (fr && fr->entry_rsp <= gpr[4]) fr = fr->prev;
@@ -289,9 +320,19 @@ void rt_resume(const u64 *gpr, const X128 *xmm, u64 rip) {
   Cpu *c = fr->c;
   memcpy(c->r, gpr, sizeof c->r);
   memcpy(c->x, xmm, sizeof c->x);
-  rt_frames = fr; rt_cur = fr->cur; rt_cur_imp = (const RtImport *)fr->cur_imp; rt_run = c;
-  rt_resume_va = rip;
+  rt_frames = fr; rt_cur = fr->cur; rt_cur_imp = (const RtImport *)fr->cur_imp; rt_run = c; rt_cb_top = (RtCb *)fr->cb;
+  rt_resume_va = rip; rt_resume_ret_va = ret; rt_resume_call = is_function_start(rip);
   longjmp(fr->jb, 1);
+}
+
+/* After the longjmp, in a frame whose function was asked to "call" `rt_resume_va`. */
+void rt_resume_enter(Cpu *c) {
+  u64 target = rt_resume_va;
+  rt_resume_call = 0;
+  c->r[4] -= 8;
+  st64((u8 *)c->r[4], rt_resume_ret_va);
+  rt_dispatch(c, target);
+  rt_trap("a function entered by an unwind returned");
 }
 
 static RtFaultHook fault_hook;
@@ -312,6 +353,15 @@ static void fault_entry(void) {
   fault_hook(&fault_info);
   fprintf(stderr, "rt: the fault hook returned\n");
   abort();
+}
+
+void rt_de(Cpu *c, u64 ip, int overflow) {
+  if (!fault_hook) rt_trap("#DE");
+  c->rip = ip;
+  /* SIGFPE with FPE_INTDIV (1) or FPE_INTOVF (2), as a real divide fault would arrive; `addr` is the instruction. */
+  fault_info = (RtFault){ 8, overflow ? 2 : 1, 0, (u64)__builtin_return_address(0), ip, c };
+  fault_entry();
+  __builtin_unreachable();
 }
 
 static void on_fault(int sig, siginfo_t *si, void *uctx) {

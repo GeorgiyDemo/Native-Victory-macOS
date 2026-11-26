@@ -15,8 +15,9 @@ pub fn install(call: GuestCall) {
 }
 
 /// Continues title code at a context (the registers an unwinder computed), dropping the frames of whatever was
-/// running below it. The arm64 host's runtime does it (`victory_rt::resume`).
-pub type GuestResume = unsafe fn(&super::seh::context::Context) -> !;
+/// running below it. The arm64 host's runtime does it (`victory_rt::resume`). `ret` is the return address to give
+/// the function when the context's `rip` is a function entry (an unwind to a target that is a function), else 0.
+pub type GuestResume = unsafe fn(&super::seh::context::Context, ret: u64) -> !;
 
 static RESUME: OnceLock<GuestResume> = OnceLock::new();
 
@@ -29,12 +30,35 @@ pub fn install_resume(resume: GuestResume) {
 ///
 /// # Safety
 /// `ctx` is an unwound context of this thread's guest stack, at a landing pad.
-pub(crate) unsafe fn resume(ctx: *const super::seh::context::Context) -> ! {
+pub(crate) unsafe fn resume(ctx: *const super::seh::context::Context, ret: u64) -> ! {
     let resume = RESUME
         .get()
         .expect("no guest resume installed (`native::guest::install_resume`)");
     // SAFETY: forwarded.
-    unsafe { resume(&*ctx) }
+    unsafe { resume(&*ctx, ret) }
+}
+
+/// The guest frame a callback (`rt_call_guest`, from a host function) was made from: registers, and the return address
+/// and stack pointer after the host call. The unwinder continues there when it reaches the bottom of a callback.
+pub struct CallbackFrame {
+    pub gpr: [u64; 16],
+    pub xmm: [[u8; 16]; 16],
+    pub rip: u64,
+    pub rsp: u64,
+}
+
+/// Looks the frame up by the stack slot of the callback's (zero) return address; `None` at the bottom of the thread.
+pub type GuestCallbackFrame = fn(slot: u64) -> Option<CallbackFrame>;
+
+static CALLBACK_FRAME: OnceLock<GuestCallbackFrame> = OnceLock::new();
+
+/// Installs the lookup of the frame a callback was made from. The first call wins.
+pub fn install_callback_frame(f: GuestCallbackFrame) {
+    let _ = CALLBACK_FRAME.set(f);
+}
+
+pub(crate) fn callback_frame(slot: u64) -> Option<CallbackFrame> {
+    CALLBACK_FRAME.get().and_then(|f| f(slot))
 }
 
 /// Calls the Windows-ABI function `f` of a title image.

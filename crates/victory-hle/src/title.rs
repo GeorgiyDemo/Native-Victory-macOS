@@ -128,6 +128,7 @@ pub mod arm64 {
     pub fn install() {
         victory_loader::native::guest::install(call_win64);
         victory_loader::native::guest::install_resume(resume_context);
+        victory_loader::native::guest::install_callback_frame(callback_frame);
         victory_rt::install_fault_hook(on_fault);
     }
 
@@ -202,13 +203,19 @@ pub mod arm64 {
     }
 
     /// Continues at an unwound context: its registers into the runtime's frame for the landing pad.
-    unsafe fn resume_context(ctx: &Context) -> ! {
+    unsafe fn resume_context(ctx: &Context, ret: u64) -> ! {
         let mut xmm = [[0u8; 16]; 16];
         for (i, x) in xmm.iter_mut().enumerate() {
             *x = *ctx.xmm(i);
         }
         // SAFETY: an unwound context at a landing pad, per the loader.
-        unsafe { victory_rt::resume(&ctx.gpr, &xmm, ctx.rip) }
+        unsafe { victory_rt::resume(&ctx.gpr, &xmm, ctx.rip, ret) }
+    }
+
+    /// The guest frame a callback was made from (`rt_callback_context`), for the unwinder.
+    fn callback_frame(slot: u64) -> Option<victory_loader::native::guest::CallbackFrame> {
+        let f = victory_rt::callback_frame(slot)?;
+        Some(victory_loader::native::guest::CallbackFrame { gpr: f.gpr, xmm: f.xmm, rip: f.rip, rsp: f.rsp })
     }
 
     #[repr(C)]
@@ -254,30 +261,39 @@ pub mod arm64 {
     unsafe extern "C" fn on_fault(f: *const victory_rt::Fault) {
         // SAFETY: the runtime's record, and the Cpu it names.
         let (fault, run) = unsafe { (&*f, &*(*f).run) };
-        let Some((base, begin)) = victory_rt::image_of_pc(fault.pc)
-            .and_then(|base| Some((base, base + lifted_function_at(fault.pc)? as usize)))
-        else {
-            eprintln!("VIctory: fault at host {:#x} outside any lifted function", fault.pc);
-            std::process::abort();
-        };
-        let end = victory_loader::native::seh::unwind::lookup(begin).map_or(begin, |(_, e)| {
-            // SAFETY: an entry of an image we mapped.
-            base + unsafe { (*e).end } as usize
-        });
-        let rsp = run.r[reg::RSP];
-        // SAFETY: the guest stack as of the last spill: the return address (or entry state) is at rsp.
-        let word = unsafe { (rsp as *const u64).read_unaligned() } as usize;
-        let (rip, sp) = if (begin..end).contains(&(run.rip as usize)) {
-            (run.rip, rsp)
-        } else if (begin..end).contains(&word) {
-            (word as u64, rsp + 8)
+        // An integer divide error the lifted code found itself (`rt_de`: SIGFPE with FPE_INTDIV or FPE_INTOVF): the
+        // registers were spilled right before and `addr` is the instruction, so the context is exact.
+        let divide = fault.signo == 8 && matches!(fault.code, 1 | 2);
+        let (rip, sp) = if divide {
+            (fault.addr, run.r[reg::RSP])
         } else {
-            (begin as u64, rsp)
+            let Some((base, begin)) = victory_rt::image_of_pc(fault.pc)
+                .and_then(|base| Some((base, base + lifted_function_at(fault.pc)? as usize)))
+            else {
+                eprintln!("VIctory: fault at host {:#x} outside any lifted function", fault.pc);
+                std::process::abort();
+            };
+            let end = victory_loader::native::seh::unwind::lookup(begin).map_or(begin, |(_, e)| {
+                // SAFETY: an entry of an image we mapped.
+                base + unsafe { (*e).end } as usize
+            });
+            let rsp = run.r[reg::RSP];
+            // SAFETY: the guest stack as of the last spill: the return address (or entry state) is at rsp.
+            let word = unsafe { (rsp as *const u64).read_unaligned() } as usize;
+            if (begin..end).contains(&(run.rip as usize)) {
+                (run.rip, rsp)
+            } else if (begin..end).contains(&word) {
+                (word as u64, rsp + 8)
+            } else {
+                (begin as u64, rsp)
+            }
         };
         let mut ctx = context_of(run, rip, sp);
         let (code, write) = match fault.signo {
             4 => (seh_context::EXCEPTION_ILLEGAL_INSTRUCTION, 0),
             5 => (seh_context::EXCEPTION_BREAKPOINT, 0),
+            8 if fault.code == 1 => (seh_context::EXCEPTION_INT_DIVIDE_BY_ZERO, 0),
+            8 if fault.code == 2 => (seh_context::EXCEPTION_INT_OVERFLOW, 0),
             8 => (seh_context::EXCEPTION_FLT_DIVIDE_BY_ZERO, 0),
             // A data abort says in bit 6 of its syndrome whether it was a write.
             _ => (seh_context::EXCEPTION_ACCESS_VIOLATION, usize::from(fault.esr & 0x40 != 0)),

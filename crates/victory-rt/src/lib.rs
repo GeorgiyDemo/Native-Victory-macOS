@@ -121,11 +121,13 @@ struct Rt {
     resume: Resume,
     image_add: ImageAdd,
     image_of_pc: ImageOfPc,
+    callback_context: CallbackContext,
 }
 type ImageAdd = unsafe extern "C" fn(*mut u8, u64, *const c_void);
 type ImageOfPc = unsafe extern "C" fn(u64) -> u64;
 type FaultInstall = unsafe extern "C" fn(unsafe extern "C" fn(*const Fault));
-type Resume = unsafe extern "C" fn(*const u64, *const [u8; 16], u64) -> !;
+type Resume = unsafe extern "C" fn(*const u64, *const [u8; 16], u64, u64) -> !;
+type CallbackContext = unsafe extern "C" fn(u64, *mut Cpu, *mut u64, *mut u64) -> i32;
 type Init = unsafe extern "C" fn(*mut u8, u64);
 type CurImport = unsafe extern "C" fn() -> *const c_char;
 type Bind = unsafe extern "C" fn(*const RtImport) -> u64;
@@ -275,6 +277,7 @@ pub fn open(dylib: &Path) -> Result<()> {
             resume: std::mem::transmute::<*mut c_void, Resume>(sym("rt_resume")?),
             image_add: std::mem::transmute::<*mut c_void, ImageAdd>(sym("rt_image_add")?),
             image_of_pc: std::mem::transmute::<*mut c_void, ImageOfPc>(sym("rt_image_of_pc")?),
+            callback_context: std::mem::transmute::<*mut c_void, CallbackContext>(sym("rt_callback_context")?),
         }
     };
     if RT.set(rt).is_err() {
@@ -345,16 +348,43 @@ pub fn install_fault_hook(hook: unsafe extern "C" fn(*const Fault)) {
     unsafe { (rt.fault_install)(hook) };
 }
 
-/// Continues lifted code at the landing pad `rip`: the innermost handler frame above `gpr[4]` (rsp) gets the
-/// registers (`gpr` in Windows CONTEXT order, `xmm0..15`) and runs on from the pad, dropping the host frames
-/// of everything below it. Does not return.
+/// Continues lifted code at `rip`: the innermost handler frame above `gpr[4]` (rsp) gets the registers (`gpr` in
+/// Windows CONTEXT order, `xmm0..15`) and runs on from there, dropping the host frames of everything below it.
+/// `rip` is a landing pad (or, in a function that has some, the address of an instruction that can fault) of the
+/// frame's function; or the start of a function, which the frame's function then calls with `ret` as the return
+/// address (what an unwind to a target that is a function does). Does not return.
 ///
 /// # Safety
-/// `rip` is a landing pad of a lifted function with a live frame above `gpr[4]` on this thread.
-pub unsafe fn resume(gpr: &[u64; 16], xmm: &[[u8; 16]; 16], rip: u64) -> ! {
+/// `rip` is one of those, in a lifted function with a live frame above `gpr[4]` on this thread.
+pub unsafe fn resume(gpr: &[u64; 16], xmm: &[[u8; 16]; 16], rip: u64, ret: u64) -> ! {
     let rt = RT.get().expect("no host loaded");
     // SAFETY: forwarded.
-    unsafe { (rt.resume)(gpr.as_ptr(), xmm.as_ptr(), rip) }
+    unsafe { (rt.resume)(gpr.as_ptr(), xmm.as_ptr(), rip, ret) }
+}
+
+/// The guest frame a callback was made from: where an unwind that reaches the bottom of the callback (a zero return
+/// address at `slot`, which is the stack pointer before it is popped) continues. `None` if the callback was not
+/// made from guest code (the bottom of the thread).
+pub struct CallbackFrame {
+    pub gpr: [u64; 16],
+    pub xmm: [[u8; 16]; 16],
+    /// The return address of the host call (in the guest frame that made it) and the stack pointer after it.
+    pub rip: u64,
+    pub rsp: u64,
+}
+
+pub fn callback_frame(slot: u64) -> Option<CallbackFrame> {
+    let rt = RT.get()?;
+    // SAFETY: Cpu is plain data.
+    let mut cpu: Cpu = unsafe { std::mem::zeroed() };
+    let (mut rip, mut rsp) = (0u64, 0u64);
+    // SAFETY: valid out pointers.
+    (unsafe { (rt.callback_context)(slot, &mut cpu, &mut rip, &mut rsp) } != 0).then(|| CallbackFrame {
+        gpr: cpu.r,
+        xmm: cpu.x,
+        rip,
+        rsp,
+    })
 }
 
 /// Name of the import the calling thread's lifted code is inside (the runtime's `rt_current_import`), for a

@@ -333,13 +333,14 @@ impl L<'_> {
             M::Vldmxcsr | M::Ldmxcsr => {}
             M::Div | M::Idiv if Self::bits0(i)? <= 16 => {
                 let bits = Self::bits0(i)?;
+                let ip = i.ip();
                 let s = self.rd(i, 0, bits)?;
                 let sgn = m == M::Idiv;
                 let body = match (bits, sgn) {
-                    (8, false) => format!("u64 n = r0 & 0xffff; u64 d = {s}; if (!d || n / d > 0xff) rt_trap(\"#DE\"); r0 = (r0 & ~0xffffull) | ((n % d) << 8) | (n / d);"),
-                    (8, true) => format!("s64 n = (s16)r0; s64 d = (s8){s}; if (!d || n / d > 127 || n / d < -128) rt_trap(\"#DE\"); r0 = (r0 & ~0xffffull) | (((u64)(n % d) & 0xff) << 8) | ((u64)(n / d) & 0xff);"),
-                    (_, false) => format!("u64 n = ((r2 & 0xffff) << 16) | (r0 & 0xffff); u64 d = {s}; if (!d || n / d > 0xffff) rt_trap(\"#DE\"); r0 = (r0 & ~0xffffull) | (n / d); r2 = (r2 & ~0xffffull) | (n % d);"),
-                    (_, true) => format!("s64 n = (s32)(((r2 & 0xffff) << 16) | (r0 & 0xffff)); s64 d = (s16){s}; if (!d || n / d > 32767 || n / d < -32768) rt_trap(\"#DE\"); r0 = (r0 & ~0xffffull) | ((u64)(n / d) & 0xffff); r2 = (r2 & ~0xffffull) | ((u64)(n % d) & 0xffff);"),
+                    (8, false) => format!("u64 n = r0 & 0xffff; u64 d = {s}; if (!d || n / d > 0xff) RT_DE({ip:#x}ull, d != 0); r0 = (r0 & ~0xffffull) | ((n % d) << 8) | (n / d);"),
+                    (8, true) => format!("s64 n = (s16)r0; s64 d = (s8){s}; if (!d || n / d > 127 || n / d < -128) RT_DE({ip:#x}ull, d != 0); r0 = (r0 & ~0xffffull) | (((u64)(n % d) & 0xff) << 8) | ((u64)(n / d) & 0xff);"),
+                    (_, false) => format!("u64 n = ((r2 & 0xffff) << 16) | (r0 & 0xffff); u64 d = {s}; if (!d || n / d > 0xffff) RT_DE({ip:#x}ull, d != 0); r0 = (r0 & ~0xffffull) | (n / d); r2 = (r2 & ~0xffffull) | (n % d);"),
+                    (_, true) => format!("s64 n = (s32)(((r2 & 0xffff) << 16) | (r0 & 0xffff)); s64 d = (s16){s}; if (!d || n / d > 32767 || n / d < -32768) RT_DE({ip:#x}ull, d != 0); r0 = (r0 & ~0xffffull) | ((u64)(n / d) & 0xffff); r2 = (r2 & ~0xffffull) | ((u64)(n % d) & 0xffff);"),
                 };
                 self.emit(&format!("{{ {body} }}"));
             }

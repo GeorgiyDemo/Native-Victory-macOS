@@ -285,6 +285,15 @@ fn stack_bounds() -> Bounds {
 /// # Safety
 /// `ctx` must describe code to run on this thread's stack.
 unsafe fn resume(ctx: *const Context) -> ! {
+    // SAFETY: forwarded from the caller.
+    unsafe { resume_with(ctx, 0) }
+}
+
+/// [`resume`], for a context whose `rip` may be the entry of a function that `ret` is the return address of.
+///
+/// # Safety
+/// As [`resume`].
+unsafe fn resume_with(ctx: *const Context, _ret: u64) -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: a valid context, per the caller.
@@ -299,8 +308,30 @@ unsafe fn resume(ctx: *const Context) -> ! {
         // comparable with a guest rsp, so all go (a dispatch begun inside a handler is forgotten).
         ACTIVE.with(|a| a.borrow_mut().clear());
         // SAFETY: forwarded from the caller.
-        unsafe { crate::native::guest::resume(ctx) }
+        unsafe { crate::native::guest::resume(ctx, _ret) }
     }
+}
+
+/// An unwind that reached the bottom of a callback (a zero return address: the guest function was called by a host
+/// function, which a guest function called) continues in the guest frame that made the host call, as if the host
+/// function were an ordinary frame. Returns false at the bottom of the thread.
+#[cfg(target_arch = "aarch64")]
+fn cross_callback(c: &mut Context) -> bool {
+    let Some(frame) = crate::native::guest::callback_frame(c.gpr[RSP].wrapping_sub(8)) else {
+        return false;
+    };
+    c.gpr = frame.gpr;
+    c.rip = frame.rip;
+    c.gpr[RSP] = frame.rsp;
+    for (i, x) in frame.xmm.iter().enumerate() {
+        *c.xmm_mut(i) = *x;
+    }
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn cross_callback(_: &mut Context) -> bool {
+    false
 }
 
 /// Dispatches an exception raised at `ctx` (the context of the raise, or of the fault): vectored handlers,
@@ -499,7 +530,7 @@ unsafe fn walk_frames(ctx: *mut Context, rec: *mut ExceptionRecord) {
         }
         c.context_flags |= CONTEXT_UNWOUND_TO_CALL;
         first = false;
-        if c.rip == 0 {
+        if c.rip == 0 && !cross_callback(&mut c) {
             return;
         }
     }
@@ -657,15 +688,18 @@ unsafe extern "C" fn unwind_ex(
             }
         }
         if frame == target_frame && target_frame != 0 {
+            // Where this frame was in its call: if the target is a function, it is entered as if the frame called
+            // it from there.
+            let ret = frame_ctx.rip;
             frame_ctx.gpr[RAX] = retval;
             frame_ctx.rip = target_ip as u64;
             frame_ctx.context_flags &= !CONTEXT_UNWOUND_TO_CALL;
             // SAFETY: the context of a live frame of this thread's stack.
-            unsafe { resume(&frame_ctx) };
+            unsafe { resume_with(&frame_ctx, ret) };
         }
         c.context_flags |= CONTEXT_UNWOUND_TO_CALL;
         first = false;
-        if c.rip == 0 {
+        if c.rip == 0 && !cross_callback(&mut c) {
             break;
         }
     }

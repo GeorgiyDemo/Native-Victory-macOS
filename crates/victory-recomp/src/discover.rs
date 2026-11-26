@@ -40,6 +40,15 @@ fn walk(img: &Image, start: u32, limit: u32) -> (u32, Vec<u32>) {
         }
         end = (i.next_ip() - base) as u32;
         let direct = matches!(i.op0_kind(), OpKind::NearBranch64);
+        // `lea reg, [rip + f]`: the address of code taken as a value, a callback or a pointer in a table built at run
+        // time. A leaf function (no `.pdata`) that is only reached this way has no other seed. Targets inside the
+        // function being walked are its own labels; those inside a function with `.pdata` are dropped by the caller.
+        if i.mnemonic() == Mnemonic::Lea && i.is_ip_rel_memory_operand() {
+            let t = i.ip_rel_memory_address().wrapping_sub(base);
+            if t < u32::MAX as u64 && !(t as u32 >= start && (t as u32) < limit) {
+                targets.push(t as u32);
+            }
+        }
         match i.flow_control() {
             FlowControl::Call if direct => targets.push((i.near_branch_target() - base) as u32),
             FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch if direct => {

@@ -66,6 +66,7 @@ pub fn lift_part(ctx: &Ctx, funcs: &[FuncIn]) -> Unit {
                     f.begin_va - ctx.image_base,
                     e.replace('"', "'")
                 );
+                body.push_str(&pad_defs(ctx, f));
                 u.failed.push((f.begin_va, e));
             }
         }
@@ -96,19 +97,49 @@ pub fn lift_part(ctx: &Ctx, funcs: &[FuncIn]) -> Unit {
 }
 
 /// The dispatch table for a split build: every function declared, sorted by RVA.
-pub fn table_unit(image_base: u64, starts: &[u64]) -> String {
+pub fn table_unit(image_base: u64, starts: &[u64], pads: &[(u64, u64)]) -> String {
     let mut c = format!("#define IMAGE_BASE {image_base:#x}ull\n#include \"rt.h\"\n");
     let mut sorted = starts.to_vec();
     sorted.sort_unstable();
     for va in &sorted {
         let _ = writeln!(c, "void {}(Cpu *c);", name(*va, image_base));
     }
-    let _ = writeln!(c, "const RtEntry rt_table[] = {{");
-    for va in &sorted {
-        let _ = writeln!(c, "  {{ {:#x}, {} }},", va - image_base, name(*va, image_base));
+    let mut pads = pads.to_vec();
+    pads.sort_unstable_by_key(|p| p.1);
+    pads.dedup_by_key(|p| p.1);
+    for &(f, p) in &pads {
+        let _ = writeln!(c, "void {}(Cpu *c);", pad_name(f, p, image_base));
     }
-    let _ = writeln!(c, "}};\nconst unsigned rt_table_n = {};", sorted.len());
+    let mut entries: Vec<(u64, String, u32)> = sorted.iter().map(|&va| (va, name(va, image_base), 0)).collect();
+    entries.extend(pads.iter().map(|&(f, p)| (p, pad_name(f, p, image_base), 1)));
+    entries.sort_unstable_by_key(|e| e.0);
+    let _ = writeln!(c, "const RtEntry rt_table[] = {{");
+    for (va, n, pad) in &entries {
+        let _ = writeln!(c, "  {{ {:#x}, {n}, {pad} }},", va - image_base);
+    }
+    let _ = writeln!(c, "}};\nconst unsigned rt_table_n = {};", entries.len());
     c
+}
+
+fn pad_name(func: u64, pad: u64, base: u64) -> String {
+    format!("pad_{:x}_{:x}", func - base, pad - base)
+}
+
+/// What a jump to a landing pad of `f` does: resume the function's frame there, with the registers the jumper has
+/// (`rt_resume`, with no return address: it is not a call). One per pad, whether or not the body could be lifted.
+fn pad_defs(ctx: &Ctx, f: &FuncIn) -> String {
+    let mut o = String::new();
+    let mut pads = f.landing_pads.clone();
+    pads.sort_unstable();
+    pads.dedup();
+    for p in pads {
+        let _ = writeln!(
+            o,
+            "void {}(Cpu *c) {{ rt_resume(c->r, c->x, (u64)H({p:#x}ull), 0); }}",
+            pad_name(f.begin_va, p, ctx.image_base)
+        );
+    }
+    o
 }
 
 fn name(va: u64, base: u64) -> String {
@@ -141,22 +172,16 @@ pub fn lift_unit(ctx: &Ctx, funcs: &[FuncIn]) -> Unit {
                     f.begin_va - ctx.image_base,
                     e.replace('"', "'")
                 );
+                u.c.push_str(&pad_defs(ctx, f));
                 u.failed.push((f.begin_va, e));
             }
         }
     }
-    let mut sorted: Vec<u64> = funcs.iter().map(|f| f.begin_va).collect();
-    sorted.sort_unstable();
-    let _ = writeln!(u.c, "const RtEntry rt_table[] = {{");
-    for va in &sorted {
-        let _ = writeln!(
-            u.c,
-            "  {{ {:#x}, {} }},",
-            va - ctx.image_base,
-            name(*va, ctx.image_base)
-        );
-    }
-    let _ = writeln!(u.c, "}};\nconst unsigned rt_table_n = {};", sorted.len());
+    let starts: Vec<u64> = funcs.iter().map(|f| f.begin_va).collect();
+    let pads: Vec<(u64, u64)> = funcs.iter().flat_map(|f| f.landing_pads.iter().map(|&p| (f.begin_va, p))).collect();
+    // The table (and `IMG`) are the same text a split build puts in table.c.
+    let table = table_unit(ctx.image_base, &starts, &pads);
+    u.c.push_str(table.split_once("#include \"rt.h\"\n").map_or("", |t| t.1));
     u
 }
 
@@ -824,21 +849,22 @@ impl L<'_> {
             }
             M::Div | M::Idiv => {
                 let bits = Self::bits0(i)?;
+                let ip = i.ip();
                 let s = self.rd(i, 0, bits)?;
                 let sgn = m == M::Idiv;
                 let body = match (bits, sgn) {
                     (8, _) | (16, _) => return Err("8/16-bit div".into()),
                     (32, false) => format!(
-                        "u64 n = (r2 << 32) | (u32)r0; u64 d = {s}; if (!d || n / d > 0xffffffffull) rt_trap(\"#DE\"); r0 = (u32)(n / d); r2 = (u32)(n % d);"
+                        "u64 n = (r2 << 32) | (u32)r0; u64 d = {s}; if (!d || n / d > 0xffffffffull) RT_DE({ip:#x}ull, d != 0); r0 = (u32)(n / d); r2 = (u32)(n % d);"
                     ),
                     (32, true) => format!(
-                        "s64 n = (s64)(((u64)(u32)r2 << 32) | (u32)r0); s64 d = (s32){s}; if (!d || n / d > INT32_MAX || n / d < INT32_MIN) rt_trap(\"#DE\"); r0 = (u32)(s32)(n / d); r2 = (u32)(s32)(n % d);"
+                        "s64 n = (s64)(((u64)(u32)r2 << 32) | (u32)r0); s64 d = (s32){s}; if (!d || n / d > INT32_MAX || n / d < INT32_MIN) RT_DE({ip:#x}ull, d != 0); r0 = (u32)(s32)(n / d); r2 = (u32)(s32)(n % d);"
                     ),
                     (_, false) => format!(
-                        "unsigned __int128 n = ((unsigned __int128)r2 << 64) | r0; u64 d = {s}; if (!d || n / d > ~0ull) rt_trap(\"#DE\"); r0 = (u64)(n / d); r2 = (u64)(n % d);"
+                        "unsigned __int128 n = ((unsigned __int128)r2 << 64) | r0; u64 d = {s}; if (!d || n / d > ~0ull) RT_DE({ip:#x}ull, d != 0); r0 = (u64)(n / d); r2 = (u64)(n % d);"
                     ),
                     (_, true) => format!(
-                        "__int128 n = (__int128)(((unsigned __int128)r2 << 64) | r0); s64 d = (s64){s}; if (!d) rt_trap(\"#DE\"); __int128 q = n / d; if (q > INT64_MAX || q < INT64_MIN) rt_trap(\"#DE\"); r0 = (u64)(s64)q; r2 = (u64)(s64)(n % d);"
+                        "__int128 n = (__int128)(((unsigned __int128)r2 << 64) | r0); s64 d = (s64){s}; if (!d) RT_DE({ip:#x}ull, d != 0); __int128 q = n / d; if (q > INT64_MAX || q < INT64_MIN) RT_DE({ip:#x}ull, d != 0); r0 = (u64)(s64)q; r2 = (u64)(s64)(n % d);"
                     ),
                 };
                 self.emit(&format!("{{ {body} }}"));
@@ -1034,6 +1060,17 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     }
     let pads: Vec<u64> = f.landing_pads.iter().copied().filter(|p| ipset.contains(p)).collect();
     labels.extend(pads.iter().copied());
+    // In a function with landing pads, a fault in the guarded code is recorded with every register (`c->rip`), and the
+    // instruction is a resume point too: an exception handler that continues execution re-runs it with the registers it
+    // chose. (EFLAGS are not carried: the lifted flags start clean, which an instruction reading them would notice.)
+    let marked = |i: &Instruction| {
+        !pads.is_empty()
+            && (matches!(i.mnemonic(), Mnemonic::Div | Mnemonic::Idiv)
+                || (!matches!(i.mnemonic(), Mnemonic::Lea | Mnemonic::Nop)
+                    && (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Memory)))
+    };
+    let resume_points: BTreeSet<u64> = pads.iter().copied().chain(f.ins.iter().filter(|i| marked(i)).map(|i| i.ip())).collect();
+    labels.extend(resume_points.iter().copied());
     let y = f.ins.iter().any(uses_vector);
     let mut l = L {
         ctx,
@@ -1054,10 +1091,10 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
             "static void fb_{:x}(Cpu *c, int resume) {{ {prologue};\nif (resume) switch (rt_resume_va - (u64)IMG + IMAGE_BASE) {{",
             f.begin_va - ctx.image_base
         );
-        for p in &pads {
+        for p in &resume_points {
             let _ = writeln!(l.o, "case {p:#x}ull: goto L_{p:x};");
         }
-        l.o.push_str("default: rt_trap(\"bad landing pad\"); }\n");
+        l.o.push_str("default: rt_trap(\"resume at an address this function has no entry for (continuing after a fault needs landing pads in the function)\"); }\n");
     }
     let mut expect = f.begin_va;
     for i in f.ins {
@@ -1071,11 +1108,7 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         }
         // In a function with landing pads a fault may be in the guarded code: record where, with every register
         // (an access violation has only the last spill otherwise).
-        if !pads.is_empty()
-            && (matches!(i.mnemonic(), Mnemonic::Div | Mnemonic::Idiv)
-                || (!matches!(i.mnemonic(), Mnemonic::Lea | Mnemonic::Nop)
-                    && (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Memory)))
-        {
+        if marked(i) {
             // The barrier keeps the compiler from moving the stores after the access that may fault.
             let _ = writeln!(l.o, "{}; c->rip = (u64)H({:#x}ull); __asm__ volatile(\"\" ::: \"memory\");", l.sp(), i.ip());
         }
@@ -1092,8 +1125,9 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         let (n, rva) = (name(f.begin_va, ctx.image_base), f.begin_va - ctx.image_base);
         let _ = writeln!(
             l.o,
-            "void {n}(Cpu *c) {{ RtFrame fr; rt_frame_enter(&fr, c); if (_setjmp(fr.jb)) fb_{rva:x}(c, 1); else fb_{rva:x}(c, 0); rt_frame_leave(&fr); }}"
+            "void {n}(Cpu *c) {{ RtFrame fr; rt_frame_enter(&fr, c); if (_setjmp(fr.jb)) {{ if (rt_resume_call) rt_resume_enter(c); fb_{rva:x}(c, 1); }} else fb_{rva:x}(c, 0); rt_frame_leave(&fr); }}"
         );
     }
+    l.o.push_str(&pad_defs(ctx, f));
     (l.o, errs)
 }
