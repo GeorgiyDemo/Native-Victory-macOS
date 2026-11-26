@@ -848,6 +848,8 @@ extern "system" fn _onexit_atexit(f: usize) -> i32 {
 mod tests {
     use super::*;
 
+    // Rosetta host only: an x86-64 thread entry that leaves through the bridge frame.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn endthreadex_exits_the_guest_thread_with_its_code() {
         use crate::host_posix::{

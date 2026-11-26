@@ -86,6 +86,9 @@ pub fn is_title_code(address: usize) -> bool {
 /// # Safety
 /// Called from a title thread entry point through a host stub.
 pub unsafe fn exit_title_thread(code: u32) -> ! {
+    // shortcut: a parked thread never runs DLL_THREAD_DETACH and never signals its handle, so a WaitForSingleObject
+    // on it would hang; upgrade to a real unwind (rt_resume to the thread entry frame) if the title waits on threads
+    // that called _endthreadex.
     tracing::warn!(code, "a title thread ended itself (_endthreadex): parked, not unwound");
     loop {
         std::thread::park();
