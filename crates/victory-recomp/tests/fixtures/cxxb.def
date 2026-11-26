@@ -1,0 +1,8 @@
+LIBRARY cxxb.dll
+EXPORTS
+b_throw_int
+b_throw_with_guard
+b_throw_thing
+b_rethrow
+b_call_cb
+b_nested

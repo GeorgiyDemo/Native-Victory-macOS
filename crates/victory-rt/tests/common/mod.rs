@@ -93,6 +93,74 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// As [`build_unit`], for a DLL built for the MSVC target (`x86_64-pc-windows-msvc`: what the title is) from `sources`
+/// (C, or C++ with exceptions on, by extension), linked by `lld-link` with no runtime of its own: import libraries
+/// come from `fixtures/<lib>.def`, exports from `__declspec(dllexport)`.
+pub fn build_msvc_unit(name: &str, sources: &[&str], libs: &[&str]) -> (Vec<u8>, PathBuf) {
+    let dir = scratch(name);
+    for lib in libs {
+        run(Command::new("/opt/homebrew/opt/llvm/bin/llvm-dlltool")
+            .args(["-m", "i386:x86-64", "-d"])
+            .arg(fixtures().join(format!("{lib}.def")))
+            .arg("-l")
+            .arg(dir.join(format!("lib{lib}.a"))));
+    }
+    let mut objects = vec![];
+    for (n, source) in sources.iter().chain(&["reloc.c"]).enumerate() {
+        let object = dir.join(format!("{n}.obj"));
+        let mut cc = Command::new("clang");
+        cc.args([
+            "--target=x86_64-pc-windows-msvc",
+            "-O1",
+            "-funwind-tables",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+            "-fno-builtin",
+            "-ffreestanding",
+            "-c",
+        ]);
+        if source.ends_with(".cpp") {
+            cc.args([
+                "-fexceptions",
+                "-fcxx-exceptions",
+                "-fno-rtti",
+                "-nostdinc++",
+                "-fms-extensions",
+                "-fno-threadsafe-statics",
+            ]);
+        }
+        run(cc.arg(fixtures().join(source)).arg("-o").arg(&object));
+        objects.push(object);
+    }
+    let dll = dir.join(format!("{name}.dll"));
+    run(Command::new("/opt/homebrew/bin/lld-link")
+        .args(["/dll", "/nodefaultlib", "/entry:DllMain", "/dynamicbase"])
+        .arg(format!("/out:{}", dll.display()))
+        .args(&objects)
+        .args(libs.iter().map(|l| dir.join(format!("lib{l}.a")))));
+    let pe = std::fs::read(&dll).unwrap();
+    lift_into(&dir, &pe);
+    std::fs::write(dir.join("rt_unit.c"), victory_recomp::RT_UNIT_C).unwrap();
+    let out = dir.join(format!("lib{name}.dylib"));
+    run(Command::new("clang")
+        .args([
+            "-arch",
+            "arm64",
+            "-O2",
+            "-ffp-contract=off",
+            "-Wno-unused",
+            "-dynamiclib",
+            "-Wl,-undefined,dynamic_lookup",
+            "-I",
+        ])
+        .arg(&dir)
+        .arg(dir.join("unit.c"))
+        .arg(dir.join("rt_unit.c"))
+        .arg("-o")
+        .arg(&out));
+    (pe, out)
+}
+
 /// The DLL as a PE, written to `dir/<name>.dll`.
 fn build_pe(dir: &Path, name: &str, source: &str, libs: &[&str], flags: &[&str]) -> Vec<u8> {
     let root = root();

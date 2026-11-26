@@ -1,0 +1,9 @@
+LIBRARY vcrt.dll
+EXPORTS
+_CxxThrowException
+__CxxFrameHandler3
+vc_log
+vc_log_get
+vc_log_reset
+
+__std_terminate
