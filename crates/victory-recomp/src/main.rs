@@ -1,0 +1,91 @@
+use anyhow::{Context, Result, bail};
+use victory_recomp::{analyze, coverage, image::Image, lift_image};
+
+const USAGE: &str = "usage: victory-recomp analyze <pe> | coverage <pe> | unsupported <pe> | lift <pe> <out.c> | lift-split <pe> <outdir> <funcs-per-unit> | flatten <pe> <out.bin> | exports <pe>";
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(2).context(USAGE)?;
+    let data = std::fs::read(path)?;
+    let img = Image::parse(&data)?;
+    match args[1].as_str() {
+        "analyze" => print!("{}", analyze::analyze(&img)?.render()),
+        "coverage" => {
+            let c = coverage(&img)?;
+            println!(
+                "functions {}  fully lifted {} ({:.1}%)",
+                c.total,
+                c.lifted,
+                c.lifted as f64 * 100.0 / c.total.max(1) as f64
+            );
+            let mut b: Vec<_> = c.blockers.iter().collect();
+            b.sort_by(|a, b| b.1.cmp(a.1));
+            println!(
+                "jmp reg with no recovered table (dispatcher tail call): {} sites in {} functions; chained parts merged: {}",
+                c.untabled_jmps, c.funcs_with_untabled_jmp, c.merged_parts
+            );
+            println!("first blocker per unlifted function (top 40):");
+            for (k, v) in b.iter().take(40) {
+                println!("  {v:>8}  {k}");
+            }
+        }
+        "unsupported" => {
+            // Every unsupported instruction (not only the first per function), by functions blocked.
+            let c = coverage(&img)?;
+            let mut b: Vec<_> = c.unsupported.iter().collect();
+            b.sort_by_key(|a| std::cmp::Reverse(a.1.1));
+            println!("unsupported reason: functions containing it, instructions (top 150)");
+            for (k, v) in b.iter().take(150) {
+                println!("  {:>8} {:>9}  {k}", v.1, v.0);
+            }
+        }
+        "lift-split" => {
+            let dir = std::path::PathBuf::from(args.get(3).context(USAGE)?);
+            let per: usize = args.get(4).context(USAGE)?.parse()?;
+            let t = std::time::Instant::now();
+            let (n, ok, stub, units) = victory_recomp::lift_image_split(&img, &dir, per)?;
+            eprintln!(
+                "{n} functions, {ok} lifted, {stub} stubbed, {units} units in {:.1}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        "jmpshapes" => {
+            for (k, v) in victory_recomp::unresolved_jmp_shapes(&img)?.iter().take(25) {
+                println!("{v:>6}  {k}");
+            }
+        }
+        "lift" => {
+            let out = args.get(3).context(USAGE)?;
+            let u = lift_image(&img)?;
+            std::fs::write(out, &u.c)?;
+            eprintln!(
+                "lifted {} functions, {} stubbed",
+                u.lifted.len(),
+                u.failed.len()
+            );
+            for (va, e) in &u.failed {
+                eprintln!("  stub {:#x}: {e}", va - img.info.image_base);
+            }
+        }
+        "flatten" => {
+            // Section data at RVA offsets: the layout the lifted code addresses (no relocations applied).
+            let out = args.get(3).context(USAGE)?;
+            let mut flat = vec![0u8; img.info.size_of_image as usize];
+            for s in &img.info.sections {
+                let raw = &data[s.file_offset as usize..(s.file_offset + s.file_size) as usize];
+                let n = raw.len().min(s.virtual_size.max(s.file_size) as usize);
+                flat[s.rva as usize..s.rva as usize + n].copy_from_slice(&raw[..n]);
+            }
+            std::fs::write(out, flat)?;
+        }
+        "exports" => {
+            for e in &img.info.exports {
+                if let (Some(n), Some(r)) = (&e.name, e.rva) {
+                    println!("{n} {r:#x}");
+                }
+            }
+        }
+        _ => bail!(USAGE),
+    }
+    Ok(())
+}
