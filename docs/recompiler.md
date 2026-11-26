@@ -8,10 +8,10 @@ This is the design for `crates/victory-recomp`, the foundation of the native mac
 |---|---|---|
 | Analysis pass (`victory-recomp analyze <pe>`) | `src/analyze.rs`, `src/image.rs` | Works on the title in about 0.6 s. |
 | Function discovery beyond .pdata | `src/discover.rs` | Works. Adds leaf functions from call targets, relocations and exports. |
-| Lifter, x86-64 to C | `src/lift.rs`, `src/rt.h` | Integer ALU, shifts, rotates, mul/div, loads/stores, push/pop, call/ret/jmp/jcc, jump tables, setcc/cmovcc, bsf/bsr/popcnt, SSE scalar and 128-bit packed float/logic, conversions, compares. |
+| Lifter, x86-64 to C | `src/lift.rs`, `src/rt.h` | Integer ALU, shifts, rotates, mul/div, `lock`/`xchg`/`cmpxchg` atomics, string ops, `bt*`, BMI1/2, all VEX forms the title uses (xmm and ymm as halves, AVX2, FMA, F16C), loads/stores, push/pop, call/ret/jmp/jcc, jump tables, setcc/cmovcc, bsf/bsr/popcnt, SSE scalar and 128-bit packed float/logic, conversions, compares. |
 | Prototype host | `src/rt_host.c`, `src/harness.h` | Dispatch by RVA over a generated table. A stand-in for the native host. |
 | Coverage report (`victory-recomp coverage <pe>`) | `src/lib.rs` | Counts functions the lifter accepts. |
-| Tests | `tests/e2e.rs`, `tests/diff.rs` | See "Test results". |
+| Tests | `tests/e2e.rs`, `tests/diff.rs`, `tests/diff_vex.rs`, `tests/diff_bits.rs` | See "Test results". |
 
 CLI: `victory-recomp analyze|coverage|lift|flatten|exports`. `lift <pe> <out.c>` writes one C unit for the whole image.
 
@@ -49,7 +49,7 @@ Self-modifying code and JIT
 - No writable executable section. No rip-relative store into an executable section (0).
 - The only suspicious import is `VirtualAlloc`. No `VirtualProtect`, `FlushInstructionCache` or `WriteProcessMemory`. The title does not look like it generates code at run time. Treat any code the title maps at run time as unknown until the host logs it (see indirect calls).
 
-Lifter coverage today (`coverage`): 257,261 of 403,953 functions (63.7%) contain only instructions the lifter accepts. This is "accepted", not "proven". The first blocker per function, top entries: `vmovaps` 49,886; `vxorps` 18,876; `vmovss` 15,098; lock/rep prefix 11,182; `vmovups` 9,280; `andn` 7,191; `bt` 5,370; indirect `jmp reg` without a table 4,803; `bextr` 4,635; `vmovdqa` 3,086; `vmovd` 2,993. So the next gains are almost all AVX forms (VEX scalar and 128/256-bit moves and logic), BMI, `bt`, and atomics.
+Lifter coverage (`coverage`): 403,899 of 403,953 functions (99.99%) lift, up from 257,261 (63.7%) at the start of this stage (86.0% after VEX, 98.5% after atomics, `bt`, BMI and string ops, then 100.0% once chained parts are merged and untabled `jmp reg` goes to the dispatcher). "Lifts" means every instruction is accepted, not that it is proven right. Honest caveats: 5,868 functions (6,112 sites) contain a `jmp reg` with no recovered table, lifted as a tail call through `rt_dispatch`; that is right for tail calls (most of them, by their `add rsp / pop / jmp` shape) and a run-time abort for any undecoded switch, so it must be watched in the unresolved-target log. The 54 functions still stubbed use AES-NI, `pclmulqdq`, SSE4A `insertq`, `vphminposuw`, `int`, and a few legacy SSE integer forms (`pshufd`, `pslldq`, `pinsrq`); 4 have decode failures. `victory-recomp unsupported <pe>` ranks every unsupported instruction by functions blocked, `jmpshapes` lists the shapes before untabled `jmp reg`.
 
 ## Design and hard problems
 
@@ -170,19 +170,48 @@ Run with `cargo test -p victory-recomp`. They run on macOS with Rosetta 2 and cl
 
 Bugs these tests found while building the lifter, now fixed: a double pop of the return address, 32-bit shifts with count 0 not zero-extending, `bsf`/`bsr` with zero source writing the destination, LLVM deleting the negative-NaN fix-up, and function end detection stopping before a forward branch target.
 
-Not tested: AVX/VEX, `lock`, GS access (no x86 oracle for `gs:` on a Mac), threads, exceptions, `pushf/popf/lahf`, 8/16-bit `div`, and floating-point signalling NaNs.
+Not tested: `adcx`/`adox` (Rosetta 2 raises SIGILL on ADX), `vcvtps2ph` rounding by MXCSR, GS access (no x86 oracle for `gs:` on a Mac), threads and the memory-ordering of atomics (a single-threaded run cannot tell them apart; the litmus tests of next step 6 are still missing), exceptions, `cpuid`/`xgetbv`/`rdtsc` (host hooks), AES/`pclmulqdq`, and floating-point signalling NaNs.
+
+### Added in this stage (all differential, 300 random inputs per snippet, x86-64 under Rosetta 2 versus lifted arm64)
+
+- `tests/diff.rs` (unchanged, 1 test, 318 snippets). Shared machinery now lives in `tests/common/difftest.rs`.
+- `tests/diff_vex.rs`, 5 tests, 1,751 snippets: `vex_arithmetic_and_integer_match_x86` (605), `vex_immediate_forms_match_x86` (388: shufps/blend/palignr/permil, all 32 `vcmp` predicates, `vround`), `vex_moves_broadcasts_and_lane_ops_match_x86` (274), `vex_shifts_blends_masks_and_flags_match_x86` (270), `vex_conversions_and_fma_match_x86` (214: every FMA form, F16C with all rounding modes, narrowing and widening converts).
+- `tests/diff_bits.rs`, 4 tests, 261 snippets: `lock_xchg_cmpxchg_match_x86` (78, including `cmpxchg16b`), `bit_tests_match_x86` (66, with bit-string addressing and `lock bts/btr/btc`), `bmi_match_x86` (64), `string_flags_and_misc_match_x86` (53: `rep movs/stos/lods`, `repe cmps`, `repne scas`, `pushfq/popfq/lahf/sahf`, `shld/shrd`, 8/16-bit `div`, `cwd`).
+
+Where Rosetta 2 and the Intel manual disagree the lifter follows the manual and the test masks the flag: `vptest`/`vtestps`/`vtestpd` leave PF=1 under Rosetta (SDM: cleared), `cmpxchg` flags are computed as dest minus accumulator by Rosetta and accumulator minus dest by the lifter (QEMU's model), and `vpsllvq`/`vpsrlvq` truncate the count to 32 bits under Rosetta. Two lifter facts the tests pinned down: a 32-bit `cmpxchg` always writes `eax` (zero-extending `rax`) even when it succeeds, and `rcpps`/`rsqrtps` return Intel's 12-bit table values, reproduced bit for bit by a formula (midpoint of the 11/10-bit mantissa index, rounded on a 2^-13 grid) instead of a table.
+
+### Design choices made in this stage
+
+- 256-bit as two 128-bit halves (`x<n>` and `xh<n>` in `Cpu`), not clang vector extensions. NEON is 128 bits wide, so clang would split a 256-bit vector type into two q registers anyway; with halves the lowering is explicit, the existing `X128` lane model is reused, each helper is tested in isolation, and only the cross-lane instructions (`vperm*`, `vinsert*`, `vextract*`) need a `Y` pair. Functions that use no VEX instruction do not carry the upper halves (`FUNC_PROLOGUE` versus `FUNC_PROLOGUE_Y`).
+- Atomics are `__atomic` builtins with `__ATOMIC_SEQ_CST` (x86 locked operations are full barriers); `xchg mem` is always atomic. Plain loads and stores stay plain (option 3 of the memory-model decision).
+- Chained `.pdata` parts are merged into their parent: the parent's instruction list is followed by each part's, and jumps between them are `goto`. 515 parts merged.
+
+## Whole-title build measurement (clang -O2, arm64)
+
+Setup: `victory-recomp lift-split <pe> <dir> 2000` writes `tu_*.c` (2,000 functions each, further cut at 600,000 bytes of x86 code), a `table.c` and `rt.h`; each unit declares only the functions it calls. Lifting takes 1.5 s on 18 cores. The whole image is 1.66 GB of C (265 units, about 6.1 MB each, 17 times the 99.9 MB of x86 `.text`), 54 stubs. Machine: 18 cores, 48 GB. Compiled with 16 parallel jobs, `-O2 -ffp-contract=off`.
+
+First pass (units of 2,000 functions, default flags), 203 of 204 units finished:
+- 203 units: 21,439 CPU seconds (5.95 CPU hours), median 105 s, p90 172 s, max 749 s wall per unit (under 16-way load; a 2,000-function unit alone takes about 68 s). Peak RSS 3.7 GB. 966 MB of objects (4.8 MB per unit). Wall time of the pass about 39 minutes plus the unit below.
+- `tu_00048.c` (32 MB) was still running after more than 30 minutes and was killed. It holds functions of 12,000 to 30,000 lines of C.
+
+Cause: `-ftime-report` on a 6,500-line function shows 83% of the time in "Machine code sinking" (the MachineSink pass), which is superlinear in blocks: a 6,500-line function takes 13.5 s, a 20,600-line one 403 s, and the two larger ones were past 15 minutes. The vectoriser and `-O1` are not the cause (`-O1` and `-fno-vectorize` give the same 13 s). With `-mllvm -disable-machine-sink` the same functions take 3.0 s and 10.7 s. That flag is now part of the recommended build line.
+
+Second pass (123 affected units regenerated and rebuilt with `-mllvm -disable-machine-sink`; the other 142 units are unchanged): all 123 compile, 925 s wall for the 123 units at 16 jobs, worst unit 348 s (tu_00067, under load), median 110 s, 10,844 CPU seconds, peak RSS 3.0 GB. Every unit now finishes; the title as a whole compiles with `-O2` in about 25 minutes wall on 18 cores (about 8 CPU hours with the flag applied everywhere, estimated). Object size is about 1.2 GB for the title.
+
+Recommendation: keep C for now. Compile cost is workable (25 minutes on a developer machine, once per lifter change, and incremental per unit), and no function made clang fail, only slow, and that was one pass. What C cannot give is cheap incremental rebuilds when the runtime header changes (everything recompiles) and run-time speed work on the flag model; those are the reasons to build an LLVM IR back-end later, not compile time. Concretely: (1) build with `-mllvm -disable-machine-sink`, (2) keep units under about 600 KB of x86 and under 2,000 functions, (3) revisit if the wall time of a full build passes an hour or the object size passes 2 GB, (4) the IR back-end is worth starting only for hot functions once the host runs, because the C output is already readable and diffable. Not measured: runtime speed of the lifted code, link time and ThinLTO, and `-O1`/`-O2` object size difference.
+
 
 ## Next steps, in order
 
-1. VEX scalar and 128-bit forms with the `Cpu` ymm halves (`vmovaps`, `vxorps`, `vmovss`, `vmovups`, `vmovdqa`, `vmovd/q`, `vbroadcastss`, `vzeroupper`, scalar arithmetic and compares, `vcvt*`). The first-blocker list shows this is about 100k of the 147k unlifted functions.
-2. Atomics and prefixes: `lock add/sub/inc/dec/cmpxchg/xadd`, `xchg mem`, `rep movs/stos`, `bt/bts/btr`, `andn/bextr/shlx/shrx/mulx/bzhi/rorx/tzcnt/lzcnt/movbe`, then `pushf/popf/lahf`.
-3. Chained `.pdata` merge, better `jmp reg` recovery, and a function-extent check against `.pdata` ends.
-4. Split output into parallel translation units; measure clang time and binary size on the full title. This tells whether C output stays viable or the LLVM IR back-end is needed.
-5. Hook up the native host: real `rt_dispatch` and HLE table, loader with relocations, `rt_gs` TEB, IAT fill. Run the first lifted title function end to end.
-6. Memory model: ask the host agent to probe for hardware TSO on native macOS; write the litmus tests; implement option 3 as a mode switch plus option 2 for synchronisation functions.
-7. 256-bit and AVX2 via clang vector extensions, FMA, shuffle/blend/permute, F16C.
-8. Exceptions: host `RtlVirtualUnwind` over `.pdata`, landing-pad entry points, fault signal mapping.
-9. Interpreter fallback for unresolved targets, so partial lifts run.
-10. Differential testing against Rosetta on whole real functions: run the same function with random register state in both and compare, once the title's code is allowed on this machine (outside the repo).
+Done in this stage: VEX 128/256-bit, FMA, F16C and AVX2 integer ops, atomics and prefixes, bit ops, BMI, flag moves, chained `.pdata` merge, `jmp reg` fallback, split build and measurement.
+
+1. Hook up the native host: real `rt_dispatch` and HLE table, loader with relocations, `rt_gs` TEB, IAT fill, `rt_cpuid`/`rt_xgetbv`/`rt_rdtsc`. Run the first lifted title function end to end.
+2. Watch the unresolved-target log for the 5,868 functions that hold an untabled `jmp reg`; recover the real switch shapes (`Add Imul ...`, `Mov Lea ...`) and feed them back.
+3. Memory model: ask the host agent to probe for hardware TSO on native macOS; write the litmus tests (message passing, store buffering) lifted versus Rosetta; option 2 for synchronisation functions.
+4. The remaining 54 stubbed functions: AES-NI, `pclmulqdq` (ARM crypto extensions), legacy SSE integer forms, `vphminposuw`.
+5. Exceptions: host `RtlVirtualUnwind` over `.pdata`, landing-pad entry points, fault signal mapping.
+6. Interpreter fallback for unresolved targets, so partial lifts run.
+7. Differential testing against Rosetta on whole real functions, once the title's code is allowed on this machine (outside the repo).
+8. Build: adopt `-mllvm -disable-machine-sink`, run the full build in CI-like scripts, measure runtime speed, then decide on an IR back-end for hot functions.
 
 Sources for the TSO notes: [Apple silicon TSO study (ASPLOS 2026)](https://www.cs.tau.ac.il/~mad/publications/asplos2026-TSO.pdf) and [the 2024 arm64 TSO prctl thread](https://lists.infradead.org/pipermail/linux-arm-kernel/2024-May/926327.html). Neither says whether macOS lets a native process enable it.
