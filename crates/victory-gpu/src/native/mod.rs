@@ -14,6 +14,7 @@
 //! physical-memory observer forwards to.
 
 pub mod addr;
+pub mod console_state;
 pub mod descriptors;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;
@@ -29,7 +30,10 @@ pub mod title;
 pub type Host = host::NativeHost<victory_metal::metal::Metal>;
 
 #[cfg(target_os = "macos")]
-pub use glue::{create_layer, frames_presented, pool_observer, pools, set_event_hook, set_layer};
+pub use glue::{
+    create_layer, frames_presented, last_frame, pool_observer, pools, set_event_hook, set_layer,
+    shader_stats,
+};
 
 /// Reads `out.len()` bytes at `at` from this process, false if they cannot be read (unmapped
 /// memory: the kernel checks, nothing faults).

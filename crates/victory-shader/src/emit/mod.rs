@@ -212,6 +212,7 @@ mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
+pub mod graphics;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -221,6 +222,10 @@ pub mod host;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
+#[cfg(test)]
+mod gfx_refusal_tests;
+#[cfg(test)]
+mod mask_tests;
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
@@ -415,6 +420,13 @@ pub struct Options {
     /// pages it writes. Memory no view holds reads 0 and its writes are dropped, unrecorded,
     /// if the host's null view is bounds-checked. Off for D3D12.
     pub zero_copy_memory: bool,
+    /// A guessed graphics vertex shader ([`graphics`]) drawn as a rectangle list: each fetched
+    /// attribute is read for the rectangle's three corners (instance-stepped, so one instance is a
+    /// rectangle) and the vertex id 0 to 3 picks a corner, the fourth being v1 + v2 - v0.
+    pub rect_list: bool,
+    /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
+    /// n, undefined values) because its pixel shader reads them.
+    pub extra_params: u32,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -482,6 +494,27 @@ pub fn emit_with(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    if !pixel && options.extra_params != 0 {
+        let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+        for n in (0..32u32).filter(|n| options.extra_params >> n & 1 != 0) {
+            if outputs.iter().any(|e| e.kind == 0 && e.index == n) {
+                continue;
+            }
+            outputs.push(container::SigElement {
+                name: "TEXCOORD".into(),
+                index: n,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(row),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
+            row += 1;
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -544,6 +577,7 @@ pub fn emit_with(
         narrow_waves: options.narrow_waves,
         wave32_host: options.wave32_host,
         zero_copy_memory: options.zero_copy_memory,
+        rect_list: options.rect_list,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
@@ -678,6 +712,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -693,6 +728,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -1274,6 +1310,7 @@ mod tests {
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
             let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let _ = &ms;
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())

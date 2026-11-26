@@ -21,8 +21,10 @@
 //! Both directions switch GS to an explicit base rather than toggling, so
 //! they nest freely: title, host, title again, and so on.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
 use victory_platform::mem::{self, Protect};
@@ -45,7 +47,7 @@ core::arch::global_asm!(
     "push r12",
     "push r13",
     "push r14",
-    "sub rsp, 0xF0",
+    "sub rsp, 0x100",
     // The four register arguments, then the registers Windows keeps for us.
     "mov [rsp + 0x30], rcx",
     "mov [rsp + 0x38], rdx",
@@ -64,6 +66,20 @@ core::arch::global_asm!(
     "mov r12, gs:[0x30]",
     "mov r13, r10",
     "mov r14, r11",
+    // Where this thread is, for the thread dump.
+    "mov rax, [rbp + 8]",
+    "mov [r12 + {in_host_ret}], rax",
+    "mov [r12 + {in_host_ctx}], r14",
+    "mov [r12 + {in_host_rbp}], rbp",
+    "mov [r12 + {in_host}], r13",
+    // VICTORY_PROFILE: the time stamp counter at entry, for traced stubs.
+    "test r14, 1",
+    "jz 9f",
+    "rdtsc",
+    "shl rdx, 32",
+    "or rax, rdx",
+    "mov [rsp + 0xF0], rax",
+    "9:",
     "mov rbx, [r12 + {host_tsd}]",
     "mov rdi, rbx",
     "mov eax, {set_gs}",
@@ -99,12 +115,14 @@ core::arch::global_asm!(
     "xor eax, eax",
     "call r13",
     "mov r13, rax",
+    "mov qword ptr [r12 + {in_host}], 0",
     "test r14, 1",
     "jz 8f",
     "lea rdi, [r14 - 1]",
     "mov esi, r13d",
     "mov rdx, [rsp + 0x30]",
     "mov rcx, [rbp + 8]",
+    "mov r8, [rsp + 0xF0]",
     "call {trace_ret}",
     "8:",
     "mov rdi, r12",
@@ -121,7 +139,7 @@ core::arch::global_asm!(
     "movaps xmm13, [rsp + 0xC0]",
     "movaps xmm14, [rsp + 0xD0]",
     "movaps xmm15, [rsp + 0xE0]",
-    "add rsp, 0xF0",
+    "add rsp, 0x100",
     "pop r14",
     "pop r13",
     "pop r12",
@@ -212,7 +230,7 @@ core::arch::global_asm!(
     "pop rbx",
     "pop rbp",
     "ret",
-    // victory_call_win64(f: rdi, args: rsi, nargs: rdx, teb: rcx) -> rax
+    // victory_call_win64(f: rdi, args: rsi, nargs: rdx, teb: rcx, exit_frame: r8) -> rax
     ".p2align 4",
     ".globl _victory_call_win64",
     "_victory_call_win64:",
@@ -224,6 +242,10 @@ core::arch::global_asm!(
     "push r14",
     "push r15",
     "sub rsp, 8",
+    "test r8, r8",
+    "jz 5f",
+    "mov [r8], rbp",
+    "5:",
     "mov r12, rdi",
     "mov r13, rsi",
     "mov r14, rdx",
@@ -259,6 +281,14 @@ core::arch::global_asm!(
     "mov eax, {set_gs}",
     "syscall",
     "mov rax, r12",
+    "jmp 6f",
+    // Return directly from the thread's outer bridge call. GS is already
+    // the host's because _endthreadex entered through a host stub.
+    ".globl _victory_exit_title_thread",
+    "_victory_exit_title_thread:",
+    "mov rbp, rdi",
+    "mov eax, esi",
+    "6:",
     "lea rsp, [rbp - 40]",
     "pop r15",
     "pop r14",
@@ -270,6 +300,10 @@ core::arch::global_asm!(
     host_tsd = const OFF_HOST_TSD,
     set_gs = const SET_GS_BASE,
     trace_ret = sym trace_ret,
+    in_host = const super::teb::OFF_IN_HOST,
+    in_host_ret = const super::teb::OFF_IN_HOST_RET,
+    in_host_ctx = const super::teb::OFF_IN_HOST_CTX,
+    in_host_rbp = const super::teb::OFF_IN_HOST_RBP,
 );
 
 /// Which method of which object a traced stub stands for.
@@ -278,27 +312,105 @@ struct Traced {
     slot: usize,
     /// An import's symbol (the area is its DLL); those log every call.
     name: &'static str,
+    /// VICTORY_PROFILE: calls, total and longest time in the call (TSC ticks).
+    calls: AtomicU64,
+    ticks: AtomicU64,
+    longest: AtomicU64,
+}
+
+/// Every `Traced` record, for the profile dump.
+static TRACED: Mutex<Vec<&'static Traced>> = Mutex::new(Vec::new());
+
+fn new_traced(area: &'static str, slot: usize, name: &'static str) -> &'static Traced {
+    let t: &'static Traced = Box::leak(Box::new(Traced {
+        area,
+        slot,
+        name,
+        calls: Default::default(),
+        ticks: Default::default(),
+        longest: Default::default(),
+    }));
+    TRACED.lock().unwrap_or_else(|e| e.into_inner()).push(t);
+    t
+}
+
+/// `VICTORY_PROFILE=<seconds>`: every title-to-host call is timed (count, total, longest) and the
+/// table is logged, longest total first, every that many seconds.
+pub(crate) fn profile_seconds() -> Option<u64> {
+    static SECS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SECS.get_or_init(|| std::env::var("VICTORY_PROFILE").ok()?.parse().ok())
+}
+
+fn tsc() -> u64 {
+    // SAFETY: rdtsc has no preconditions.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Starts the thread that logs the profile.
+pub(crate) fn start_profile() {
+    let Some(secs) = profile_seconds() else { return };
+    std::thread::spawn(move || {
+        let (t0, c0) = (std::time::Instant::now(), tsc());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let per_ms = (tsc() - c0) as f64 / t0.elapsed().as_secs_f64() / 1000.0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let mut rows: Vec<_> = TRACED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|t| (t.ticks.load(Ordering::Relaxed), *t))
+                .filter(|(_, t)| t.calls.load(Ordering::Relaxed) > 0)
+                .collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+            tracing::warn!("profile at {:.1}s: {} methods", t0.elapsed().as_secs_f64(), rows.len());
+            for (ticks, t) in rows.iter().take(40) {
+                tracing::warn!(
+                    "profile {}!{}{:#x} calls {} total {:.1} ms max {:.2} ms",
+                    t.area,
+                    t.name,
+                    t.slot * 8,
+                    t.calls.load(Ordering::Relaxed),
+                    *ticks as f64 / per_ms,
+                    t.longest.load(Ordering::Relaxed) as f64 / per_ms
+                );
+            }
+        }
+    });
 }
 
 /// The context word that makes a stub log its results: `area!name` imports
 /// when `VICTORY_TRACE_IMPORTS` is set (see [`trace_imports`]).
 pub(crate) fn traced_import(dll: &str, symbol: &str) -> usize {
     let leak = |s: &str| &*Box::leak(s.to_string().into_boxed_str());
-    let info = Box::leak(Box::new(Traced {
-        area: leak(dll),
-        slot: 0,
-        name: leak(symbol),
-    }));
+    let info = new_traced(leak(dll), 0, leak(symbol));
     info as *const Traced as usize | 1
 }
 
 /// Whether to log every call of every import (`VICTORY_TRACE_IMPORTS=1`).
 pub(crate) fn trace_imports() -> bool {
-    std::env::var_os("VICTORY_TRACE_IMPORTS").is_some_and(|v| v != "0")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_IMPORTS").is_some_and(|v| v != "0"))
 }
 
-extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
-    if hr < 0 || trace_level() == 2 || !info.name.is_empty() {
+/// `(dll, symbol)` of an import stub's context word, as [`traced_import`] made it.
+pub(crate) fn traced_name(context: usize) -> Option<(&'static str, &'static str, usize)> {
+    if context & 1 == 0 {
+        return None;
+    }
+    // SAFETY: odd context words are leaked `Traced` records plus one.
+    let info = unsafe { &*((context - 1) as *const Traced) };
+    Some((info.area, info.name, info.slot * 8))
+}
+
+extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize, start: u64) {
+    if profile_seconds().is_some() {
+        let d = tsc().wrapping_sub(start);
+        info.calls.fetch_add(1, Ordering::Relaxed);
+        info.ticks.fetch_add(d, Ordering::Relaxed);
+        info.longest.fetch_max(d, Ordering::Relaxed);
+    }
+    if if info.name.is_empty() { trace_level() > 0 && (hr < 0 || trace_level() == 2) } else { trace_imports() } {
         tracing::warn!(
             area = info.area,
             name = info.name,
@@ -317,17 +429,25 @@ extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
 /// 0 off, 1 failing results (negative `eax`; a method returning a pointer
 /// or a count shows up as noise), 2 every call.
 fn trace_level() -> u8 {
-    match std::env::var("VICTORY_TRACE_FAILS").as_deref() {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_TRACE_FAILS").as_deref() {
         Ok("0") | Err(_) => 0,
         Ok("2") => 2,
         Ok(_) => 1,
-    }
+    })
 }
 
 unsafe extern "C" {
     fn victory_bridge_to_host();
     fn victory_bridge_win64();
-    fn victory_call_win64(f: usize, args: *const u64, nargs: usize, teb: *mut u8) -> u64;
+    fn victory_call_win64(
+        f: usize,
+        args: *const u64,
+        nargs: usize,
+        teb: *mut u8,
+        exit_frame: *mut usize,
+    ) -> u64;
+    fn victory_exit_title_thread(frame: usize, code: u32) -> !;
 }
 
 /// Most arguments [`call_win64`] and the System V bridge pass.
@@ -344,7 +464,58 @@ pub unsafe fn call_win64(f: usize, args: &[u64]) -> u64 {
     let mut padded = [0u64; MAX_ARGS];
     padded[..args.len()].copy_from_slice(args);
     // SAFETY: forwarded from the caller; `padded` holds at least 4 words.
-    unsafe { victory_call_win64(f, padded.as_ptr(), args.len(), teb::current()) }
+    unsafe {
+        victory_call_win64(
+            f,
+            padded.as_ptr(),
+            args.len(),
+            teb::current(),
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+thread_local! {
+    static THREAD_EXIT_FRAME: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Calls a thread entry point, which can return or exit through
+/// [`exit_title_thread`]. Nested `call_win64` calls leave this frame in place.
+///
+/// # Safety
+/// As for [`call_win64`], with one argument and no active thread entry frame.
+pub(super) unsafe fn call_thread_entry(f: usize, param: usize) -> u32 {
+    THREAD_EXIT_FRAME.with(|frame| {
+        debug_assert_eq!(frame.get(), 0);
+        let args = [param as u64, 0, 0, 0];
+        // SAFETY: forwarded from the caller; assembly records the frame for this call.
+        let code =
+            unsafe { victory_call_win64(f, args.as_ptr(), 1, teb::current(), frame.as_ptr()) };
+        frame.set(0);
+        code as u32
+    })
+}
+
+/// Returns from the active thread entry point with `code`, leaving the
+/// loader to run its thread-detach notifications and finish the thread.
+///
+/// # Safety
+/// Must be called from a guest thread entry via a host stub with host GS.
+/// This abandons the intervening guest and host callback frames.
+pub unsafe fn exit_title_thread(code: u32) -> ! {
+    let frame = THREAD_EXIT_FRAME.get();
+    if frame == 0 {
+        tracing::error!("thread exit outside a title thread entry point");
+        std::process::abort();
+    }
+    // SAFETY: this thread owns the TEB and the live bridge frame.
+    unsafe {
+        teb::current()
+            .add(teb::OFF_IN_HOST)
+            .cast::<usize>()
+            .write(0);
+        victory_exit_title_thread(frame, code);
+    }
 }
 
 /// Host functions written `extern "win64"` (arguments in the Windows ABI,
@@ -467,7 +638,7 @@ pub unsafe fn bridged_table(
     let mut unique: Vec<(usize, bool)> = targets.clone();
     unique.sort_unstable();
     unique.dedup();
-    let tracing_on = trace_level() > 0;
+    let tracing_on = trace_level() > 0 || profile_seconds().is_some();
     let mut block = StubBlock::new(unique.len() + len + SPARE_SLOTS)?;
     let mut stub_of = std::collections::HashMap::new();
     let mut copy: Vec<usize> = Vec::with_capacity(len + SPARE_SLOTS);
@@ -478,11 +649,7 @@ pub unsafe fn bridged_table(
                 copy.push(0);
                 continue;
             }
-            let info = Box::leak(Box::new(Traced {
-                area,
-                slot,
-                name: "",
-            }));
+            let info = new_traced(area, slot, "");
             let ctx = info as *const Traced as usize | 1;
             let win64 = is_win64(s as usize);
             // win64 targets skip the remapping and cannot be traced.

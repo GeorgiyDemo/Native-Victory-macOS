@@ -78,3 +78,16 @@ pub unsafe fn call_win64(f: usize, args: &[u64]) -> u64 {
 pub fn is_title_code(address: usize) -> bool {
     super::seh::unwind::image_base_of(address).is_some()
 }
+
+/// `_endthreadex`: ends the calling title thread. The arm64 host cannot yet abandon the guest and host frames
+/// below it (the Rosetta host leaves through its bridge frame), so the thread parks for good instead: its
+/// thread-detach notices do not run and its result is not delivered.
+///
+/// # Safety
+/// Called from a title thread entry point through a host stub.
+pub unsafe fn exit_title_thread(code: u32) -> ! {
+    tracing::warn!(code, "a title thread ended itself (_endthreadex): parked, not unwound");
+    loop {
+        std::thread::park();
+    }
+}

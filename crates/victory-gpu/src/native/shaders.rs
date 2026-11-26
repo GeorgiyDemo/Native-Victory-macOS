@@ -34,6 +34,18 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
     victory_shader::emit::translate_with(container, options()).map_err(|e| e.to_string())
 }
 
+/// A guessed vertex shader's container translated to draw rectangle lists (`Options::rect_list`).
+pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, Options { rect_list: true, ..options() }).map_err(|e| e.to_string())
+}
+
+/// A guessed vertex shader's container translated for rectangle lists or not, writing the
+/// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write.
+pub fn translate_extra(container: &[u8], rect: bool, extra: u32) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, Options { rect_list: rect, extra_params: extra, ..options() })
+        .map_err(|e| e.to_string())
+}
+
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
 /// give the page table (compute shaders).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
@@ -49,13 +61,6 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.heap {
         return Some("indexes the descriptor heap itself");
     }
-    if shader
-        .user_data
-        .iter()
-        .any(|u| u.root == victory_shader::RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW)
-    {
-        return Some("reads root views as heap views");
-    }
     None
 }
 
@@ -66,10 +71,7 @@ fn refusal(vs: &HostShader, ps: Option<&HostShader>) -> Option<&'static str> {
             return Some(why);
         }
     }
-    // One argument block serves both stages (the vertex shader's); a pixel shader with arguments
-    // of its own has none.
-    ps.filter(|p| !p.user_data.is_empty() || !Binding::of(p).views.is_empty())
-        .map(|_| "the pixel stage reads root arguments of its own")
+    None
 }
 
 /// The thread-group size a compute container declares (`PSV0`'s runtime info).
@@ -194,6 +196,8 @@ impl<B: PresentBackend> Title<B> {
         h.update(&vs.dxil);
         h.update(ps.map_or(&[][..], |p| &p.dxil));
         h.update(format!("{graphics:?}").as_bytes());
+        // The arguments are part of the pipeline's binding.
+        h.update(format!("{:?}{:?}", vs.user_data, ps.map(|p| &p.user_data)).as_bytes());
         let key = *h.finalize().as_bytes();
         if let Some(p) = self.libraries.render.get(&key) {
             self.shaders.cached += 1;
@@ -215,11 +219,18 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.refuse(name, "no input signature".into());
             return Pipe::Refused;
         };
-        let Some((attributes, streams)) = g.vertex_layout(&reads) else {
+        let Some((mut attributes, streams)) = g.vertex_layout(&reads) else {
             self.shaders
                 .refuse(name, "the vertex shader reads an input the layout lacks".into());
             return Pipe::Refused;
         };
+        // A system value ahead of the attributes takes an attribute number: described as the
+        // attribute after it, which the converter's function ignores.
+        for at in state::system_gaps(&vs.dxil) {
+            if let Some(next) = attributes.get(at).copied() {
+                attributes.insert(at, next);
+            }
+        }
         let (Some(color), Ok(depth)) = (g.color_formats(), g.depth_format()) else {
             self.shaders.refuse(name, "a target format the host does not know".into());
             return Pipe::Refused;
@@ -245,7 +256,10 @@ impl<B: PresentBackend> Title<B> {
         match self.host.render_pipeline(&desc) {
             Ok(p) => {
                 self.shaders.pipelines += 1;
-                Pipe::Render(p, Some(Rc::new(Binding::of(vs))))
+                Pipe::Render(p, Some(Rc::new(Binding {
+                    ps: ps.map(Binding::of).filter(|b| b.dwords > 0 || !b.views.is_empty()).map(Rc::new),
+                    ..Binding::of(vs)
+                })))
             }
             Err(e) => {
                 self.shaders.refuse(name, format!("conversion: {e}"));

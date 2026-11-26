@@ -7,6 +7,18 @@ use anyhow::{Context, Result};
 use victory_platform::thread::{self, Thread};
 
 use super::call_win64;
+#[cfg(target_arch = "x86_64")]
+use super::bridge::call_thread_entry;
+
+/// A thread's start routine: a plain guest call on the arm64 host (no exit frame to leave through).
+///
+/// # Safety
+/// As for [`call_win64`], with one argument.
+#[cfg(target_arch = "aarch64")]
+unsafe fn call_thread_entry(f: usize, param: usize) -> u32 {
+    // SAFETY: forwarded.
+    unsafe { call_win64(f, &[param as u64]) as u32 }
+}
 use super::image::NativeImage;
 use super::teb;
 use crate::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH};
@@ -183,7 +195,7 @@ pub unsafe fn spawn_title_thread_with(
         on_start();
         notify_threads(DLL_THREAD_ATTACH);
         // SAFETY: forwarded from the caller.
-        let code = unsafe { call_win64(start, &[param as u64]) } as u32;
+        let code = unsafe { call_thread_entry(start, param) };
         notify_threads(DLL_THREAD_DETACH);
         on_exit(code);
         code
@@ -221,6 +233,10 @@ pub unsafe fn run_entry_with(
         .unwrap_or(usize::MAX)
         .max(1 << 20);
     teb::set_image_base(image.base());
+    #[cfg(target_arch = "x86_64")]
+    super::dump::start();
+    #[cfg(target_arch = "x86_64")]
+    super::bridge::start_profile();
     let dlls = dlls.to_vec();
     let failure = std::sync::Arc::new(Mutex::new(None::<String>));
     let failed = failure.clone();
@@ -240,7 +256,7 @@ pub unsafe fn run_entry_with(
             }
             register_thread_callbacks(image);
             attach(image, DLL_PROCESS_ATTACH);
-            let code = call_win64(entry, &[0]) as u32;
+            let code = call_thread_entry(entry, 0);
             attach(image, DLL_PROCESS_DETACH);
             for dll in dlls.iter().rev() {
                 attach_dll(&dll.image, DLL_PROCESS_DETACH, 1);

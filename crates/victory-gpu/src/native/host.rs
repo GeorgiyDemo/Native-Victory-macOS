@@ -62,6 +62,8 @@ const RETIRED: usize = 8;
 /// submission has been handed over.
 struct Prep<B: GraphicsBackend> {
     root: RootArgs,
+    /// The pixel stage's own arguments.
+    ps_root: Option<RootArgs>,
     bufs: Vec<Rc<B::Buffer>>,
     vertex: Vec<(Rc<B::Buffer>, *const u8)>,
     index: Option<(Rc<B::Buffer>, *const u8)>,
@@ -294,8 +296,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
         &self,
         root: &[Option<Root<B>>],
         b: &Binding,
+        heap: Option<&Rc<NativeHeap<B>>>,
         p: &mut Prep<B>,
     ) -> Result<(), String> {
+        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_UAV_VIEW, ROOT_VIEW_OFFSET};
         use victory_shader::RootType;
         let set = |slot: u8| {
             root.get(usize::from(slot))
@@ -314,6 +318,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     (RootType::Table, Root::Table(h, at)) => (*at as u64 * Self::step(h.kind)) as u32,
                     (RootType::Descriptor, Root::View(a)) if u.dword < 2 => {
                         (a >> (32 * u.dword)) as u32
+                    }
+                    // A view of the pool holding the root view, and the address's offset in it.
+                    (RootType::Descriptor, Root::View(a))
+                        if matches!(u.dword, ROOT_SRV_VIEW | ROOT_UAV_VIEW | ROOT_VIEW_OFFSET) =>
+                    {
+                        let heap = match &p.heap {
+                            Some(h) => h.clone(),
+                            None => match heap {
+                                Some(h) => h.clone(),
+                                None => self.host_heap()?,
+                            },
+                        };
+                        p.heap = Some(heap.clone());
+                        let (view, offset) = self.root_view(&heap, *a);
+                        match u.dword {
+                            ROOT_SRV_VIEW => view,
+                            ROOT_UAV_VIEW => view + 1,
+                            _ => offset,
+                        }
                     }
                     (kind, _) => {
                         return Err(format!(
@@ -405,6 +428,29 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(())
     }
 
+    /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
+    fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
+        let maps = self.mapping_list();
+        addr::root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
+    }
+
+    /// The pool table as the page table builder reads it.
+    fn mapping_list(&self) -> Vec<Mapping> {
+        self.memory
+            .mappings()
+            .1
+            .iter()
+            .map(|(at, len, pool, offset)| Mapping {
+                at: *at as u64,
+                len: *len as u64,
+                pool: pool.id,
+                base: pool.base,
+                pool_len: pool.len as u64,
+                offset: *offset as u64,
+            })
+            .collect()
+    }
+
     /// What a shader that finds title memory through the page table is given besides its user data:
     /// the table (the last root parameter) and, in the heap it reads, the view pairs.
     fn memory_args(
@@ -462,9 +508,185 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(())
     }
 
+    /// `VICTORY_TRACE_TARGETS=1`: the root parameters of the first draws that have vertex buffers,
+    /// and the title memory they name (descriptor words, then the first 64 bytes at the address a
+    /// constant buffer descriptor holds).
+    fn trace_draw(&self, root: &[Option<Root<B>>], binding: Option<&Binding>, dispatch: bool) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+        if std::env::var_os("VICTORY_TRACE_TARGETS").is_none() || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
+            return;
+        }
+        let read = |at: u64, n: usize| {
+            let mut b = vec![0u8; n];
+            let ok = super::safe_read(at as *const u8, &mut b);
+            let words: Vec<String> = b.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap()))).collect();
+            format!("{}{}", if ok { "" } else { "UNREADABLE " }, words.join(" "))
+        };
+        for (i, r) in root.iter().enumerate() {
+            match r {
+                Some(Root::Constants(w)) => tracing::info!(slot = i, ?w, "draw root constants"),
+                Some(Root::View(a)) => tracing::info!(slot = i, addr = format!("{a:#x}"), mem = read(*a, 64), "draw root view"),
+                Some(Root::Table(h, at)) => {
+                    let base = h.start + *at as u64 * Self::step(h.kind);
+                    let d = read(base, 32 * 4);
+                    tracing::info!(slot = i, heap_start = format!("{:#x}", h.start), index = at, kind = ?h.kind, descriptors = d, "draw root table");
+                    for k in 0..4u64 {
+                        let handle = base + k * Self::step(h.kind);
+                        match crate::descriptor::view(handle) {
+                            Some(crate::descriptor::View::Constant(a, n)) => tracing::info!(entry = k, addr = format!("{a:#x}"), size = n, mem = read(a, 64), "table constant buffer"),
+                            Some(crate::descriptor::View::Shader(r, d)) => {
+                                #[cfg(target_os = "macos")]
+                                let info = crate::resource::texture_info(r as crate::object::This);
+                                #[cfg(not(target_os = "macos"))]
+                                let info: Option<super::textures::TextureInfo> = None;
+                                let (nz, total) = info.as_ref().map_or((0, 0), |i| {
+                                    let m = super::textures::read_memory(i.memory, i.size.min(1 << 22));
+                                    (m.iter().filter(|&&b| b != 0).count(), m.len())
+                                });
+                                tracing::info!(entry = k, resource = format!("{r:#x}"), desc = ?d, texture = ?info.as_ref().map(|i| (i.format, i.width, i.height, i.memory as usize, i.size)), nonzero_bytes = nz, of = total, "table texture");
+                            }
+                            Some(crate::descriptor::View::Unordered(r, counter, d)) => {
+                                let info = texture_info_of(r);
+                                let buffer = self.resources.borrow().get(&r).map(|b| match b {
+                                    Res::Buffer(a, n) => (*a, *n),
+                                    _ => (0, 0),
+                                });
+                                tracing::info!(entry = k, resource = format!("{r:#x}"), counter, desc = ?d, texture = ?info.as_ref().map(|i| (i.format, i.width, i.height, i.memory as usize, i.size)), buffer = ?buffer, "table unordered view");
+                            }
+                            Some(crate::descriptor::View::Placed(_, res, d)) => tracing::info!(entry = k, ?res, ?d, "table placed view"),
+                            Some(v) => tracing::info!(entry = k, ?v, "table view"),
+                            None => {}
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        if let Some(b) = binding {
+            tracing::info!(dwords = b.dwords, user_data = ?b.user_data, views = ?b.views, ps = ?b.ps.as_ref().map(|p| p.user_data.clone()), "draw binding");
+        }
+    }
+
+    /// `VICTORY_TRACE_CONTENT=<dir>`: for the first draws into a depth target, every texture and
+    /// constant buffer their descriptor tables hold: its view, the fraction of its title memory
+    /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
+    /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
+    #[inline(never)]
+    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let start = START.get_or_init(std::time::Instant::now);
+        let Some(v) = std::env::var_os("VICTORY_TRACE_CONTENT") else { return };
+        // `<dir>[,<seconds>]`: from that many seconds after the first draw on.
+        let v = v.to_string_lossy().into_owned();
+        let (dir, after) = v.rsplit_once(',').map_or((v.as_str(), 0), |(d, s)| (d, s.parse().unwrap_or(0)));
+        let dir = std::path::PathBuf::from(dir);
+        if start.elapsed().as_secs() < after {
+            return;
+        }
+        // The boot passes (a 3840-wide texture sampled, nothing else) are skipped.
+        let boot = root.iter().any(|r| {
+            let Some(Root::Table(h, at)) = r else { return false };
+            let base = h.start + *at as u64 * Self::step(h.kind);
+            (0..8u64).any(|k| match crate::descriptor::view(base + k * Self::step(h.kind)) {
+                Some(crate::descriptor::View::Shader(r, _)) => texture_info_of(r).is_some_and(|i| i.width >= 3840),
+                _ => false,
+            })
+        });
+        // ... and the fullscreen triangle's (one 96-byte constant buffer and no texture).
+        let plain = !root.iter().any(|r| {
+            let Some(Root::Table(h, at)) = r else { return false };
+            let base = h.start + *at as u64 * Self::step(h.kind);
+            (0..8u64).any(|k| match crate::descriptor::view(base + k * Self::step(h.kind)) {
+                Some(crate::descriptor::View::Shader(..) | crate::descriptor::View::Placed(..)) => true,
+                Some(crate::descriptor::View::Constant(_, n)) => n != 96,
+                _ => false,
+            })
+        });
+        if boot || plain {
+            return;
+        }
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n >= 600 {
+            return;
+        }
+        let ppm = |name: String, w: usize, h: usize, px: &[u8], bgra: bool| {
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            let _ = std::fs::write(std::path::Path::new(&dir).join(name), out);
+        };
+        let kinds: Vec<String> = root
+            .iter()
+            .map(|r| match r {
+                Some(Root::Constants(w)) => format!("constants{w:?}"),
+                Some(Root::View(a)) => format!("view{a:#x}"),
+                Some(Root::Table(_, at)) => format!("table@{at}"),
+                None => "unset".into(),
+            })
+            .collect();
+        let head = vertex.first().map(|&a| {
+            let mut b = [0u8; 32];
+            super::safe_read(a as *const u8, &mut b);
+            b
+        });
+        tracing::info!(draw = n, ?kinds, ?vertex, ?call, ?head, "content: draw");
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            let base = h.start + *at as u64 * Self::step(h.kind);
+            for k in 0..8u64 {
+                let handle = base + k * Self::step(h.kind);
+                let (key, info, what) = match crate::descriptor::view(handle) {
+                    Some(crate::descriptor::View::Constant(a, size)) => {
+                        let mut b = vec![0u8; (size as usize).min(1 << 16)];
+                        let ok = super::safe_read(a as *const u8, &mut b);
+                        let nz = b.iter().filter(|&&x| x != 0).count();
+                        let floats: Vec<f32> = b.as_chunks::<4>().0.iter().take(24).map(|w| f32::from_le_bytes(*w)).collect();
+                        tracing::info!(draw = n, slot, entry = k, addr = format!("{a:#x}"), size, readable = ok, nonzero = nz, ?floats, "content: constant buffer");
+                        continue;
+                    }
+                    Some(crate::descriptor::View::Shader(r, d)) => (r, texture_info_of(r), format!("srv {d:?}")),
+                    Some(crate::descriptor::View::Placed(_, res, d)) if res[0] > 1 => {
+                        let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                        (super::textures::placed_key(address, &res), placed_info_of(address, &res), format!("placed {res:?}"))
+                    }
+                    _ => continue,
+                };
+                let Some(info) = info else {
+                    tracing::info!(draw = n, slot, entry = k, what, "content: view without a texture");
+                    continue;
+                };
+                let tiled = super::textures::read_memory(info.memory, info.size.min(1 << 26));
+                let nz = tiled.iter().filter(|&&b| b != 0).count();
+                tracing::info!(draw = n, slot, entry = k, key = format!("{key:#x}"), format = info.format, w = info.width, h = info.height, layers = info.depth_or_layers, flags = info.flags, at = format!("{:#x}", info.memory as usize), size = info.size, nonzero = nz, fraction = nz as f64 / tiled.len().max(1) as f64, what, "content: texture");
+                if !matches!(info.format, 28 | 87 | 91 | 29) || SEEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+                    continue;
+                }
+                SEEN.lock().unwrap_or_else(|e| e.into_inner()).push(key);
+                let (w, hh) = (info.width as usize, info.height as usize);
+                let bgra = matches!(info.format, 87 | 91);
+                let mut px = vec![0u8; w * hh * 4];
+                if let Some(desc) = info.desc()
+                    && let Ok(tmp) = self.backend.create_texture(&desc)
+                    && super::textures::upload(&self.backend, &tmp, &info, &tiled).is_ok()
+                {
+                    self.backend.read_texture(&tmp, 0, 0, &mut px, w * 4, w * hh * 4);
+                    ppm(format!("c{n}_{k}_title.ppm"), w, hh, &px, bgra);
+                }
+                if let Some(Res::Texture(t)) = self.resources.borrow().get(&key) {
+                    self.backend.read_texture(t, 0, 0, &mut px, w * 4, w * hh * 4);
+                    ppm(format!("c{n}_{k}_host.ppm"), w, hh, &px, bgra);
+                }
+            }
+        }
+    }
+
     fn prep(&self, cmd: &Cmd<B>) -> Result<Prep<B>, String> {
         let mut p = Prep {
             root: RootArgs::default(),
+            ps_root: None,
             bufs: vec![],
             vertex: vec![],
             index: None,
@@ -473,25 +695,52 @@ impl<B: GraphicsBackend> NativeHost<B> {
         };
         match cmd {
             Cmd::Dispatch {
-                root, pso, heaps, ..
-            } => match &pso.binding {
+                root, pso, heaps, groups, ..
+            } => {
+                tracing::debug!(?groups, "dispatch");
+                if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
+                    static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if G.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                        tracing::info!(?groups, threads = ?pso.threads, "dispatch");
+                    }
+                }
+                self.trace_draw(root, pso.binding.as_ref(), true);
+                match &pso.binding {
                 Some(b) => {
-                    self.translated_args(root, b, &mut p)?;
+                    self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
                     if b.memory {
                         self.memory_args(heaps.0.as_ref(), &mut p)?;
+                    } else if let Some(h) = p.heap.clone() {
+                        self.write_pairs(&h)?;
                     }
                 }
                 None => self.root_args(root, &mut p)?,
-            },
+            }},
             Cmd::Draw {
                 root,
                 binding,
+                heaps,
                 vertex,
                 index,
+                call,
                 ..
             } => {
+                if !vertex.is_empty() {
+                    self.trace_draw(root, binding.as_deref(), false);
+                }
+                self.trace_content(root, vertex, call);
                 match binding {
-                    Some(b) => self.translated_args(root, b, &mut p)?,
+                    Some(b) => {
+                        self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
+                        if let Some(ps) = &b.ps {
+                            let vs_args = std::mem::take(&mut p.root);
+                            self.translated_args(root, ps, heaps.0.as_ref(), &mut p)?;
+                            p.ps_root = Some(std::mem::replace(&mut p.root, vs_args));
+                        }
+                        if let Some(h) = p.heap.clone() {
+                            self.write_pairs(&h)?;
+                        }
+                    }
                     None => self.root_args(root, &mut p)?,
                 }
                 for a in vertex {
@@ -681,7 +930,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     topology: *topology,
                                     state: *state,
                                     root: preps[k].root.clone(),
-                                    heaps: heaps(h),
+                                    fragment_root: preps[k].ps_root.clone(),
+                                    heaps: match &preps[k].heap {
+                                        Some(m) => Heaps {
+                                            resource: Some(&m.heap),
+                                            sampler: h.1.as_ref().map(|s| &s.heap),
+                                        },
+                                        None => heaps(h),
+                                    },
                                     resources: preps[k].bufs.iter().map(|b| &**b).collect(),
                                     vertex_buffers: preps[k]
                                         .vertex
@@ -706,4 +962,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
             },
         )
     }
+}
+
+/// The title texture a view names (macOS only; the target trace's).
+#[cfg(target_os = "macos")]
+fn texture_info_of(r: usize) -> Option<super::textures::TextureInfo> {
+    crate::resource::texture_info(r as crate::object::This)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn placed_info_of(address: u64, res: &[u32; 14]) -> Option<super::textures::TextureInfo> {
+    crate::resource::placed_info(address, res)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn placed_info_of(_: u64, _: &[u32; 14]) -> Option<super::textures::TextureInfo> {
+    None
 }

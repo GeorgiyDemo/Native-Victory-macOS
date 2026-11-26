@@ -73,6 +73,9 @@ pub(crate) struct Shader {
     /// Its translation for the native host (container let go once made).
     #[cfg(target_os = "macos")]
     native: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
+    /// Its translation for rectangle lists (guessed vertex shaders; made at the first such draw).
+    #[cfg(target_os = "macos")]
+    rect: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -107,6 +110,8 @@ impl Shader {
             translated: OnceLock::new(),
             #[cfg(target_os = "macos")]
             native: std::sync::OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            rect: std::sync::OnceLock::new(),
         }
     }
 
@@ -117,8 +122,36 @@ impl Shader {
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
-                *container = Vec::new();
+                if (made.is_err() || std::env::var_os("VICTORY_DUMP_ALL_SHADERS").is_some())
+                    && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
+                {
+                    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{}.bin", self.stage, self.hash)), &*container);
+                }
+                // A vertex shader keeps its container: a rectangle-list draw translates it again.
+                if self.stage != "vertex" {
+                    *container = Vec::new();
+                }
                 made
+            })
+            .as_ref()
+            .map_err(String::as_str)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Shader {
+    /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
+    pub(crate) fn translate_extra(&self, rect: bool, extra: u32) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        crate::native::shaders::translate_extra(&container, rect, extra).map(Arc::new)
+    }
+
+    /// The translation for rectangle-list draws, made on first use.
+    pub(crate) fn native_rect(&self) -> Result<&Arc<victory_shader::emit::HostShader>, &str> {
+        self.rect
+            .get_or_init(|| {
+                let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                crate::native::shaders::translate_rect(&container).map(Arc::new)
             })
             .as_ref()
             .map_err(String::as_str)
@@ -278,10 +311,23 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static BINDS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        let n = BINDS[usize::from(p.graphics.is_some())].fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(with_state = p.graphics.is_some(), binds = n, "pipeline binds so far");
+        }
+    }
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let frame = crate::frame::current();
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        tracing::info!(pipeline = ?this, frame, with_state = p.graphics.is_some(), shaders = p.shaders.len(), "bound for the first time");
+    }
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
     }
@@ -435,6 +481,24 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+/// A new pipeline with `base`'s shaders and `graphics` (device method 0x1b8, see
+/// `native::console_state`).
+#[cfg(target_os = "macos")]
+pub(crate) fn derive(
+    base: This,
+    graphics: impl FnOnce(Option<&crate::native::state::Graphics>) -> crate::native::state::Graphics,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if base.is_null() {
+        return E_INVALIDARG;
+    }
+    let from = pipeline(base);
+    let shaders = from.shaders.clone();
+    let graphics = graphics(from.graphics.as_deref());
+    hand_out(shaders, Some(Box::new(graphics)), iid, out)
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_graphics(
     _: This,
@@ -472,6 +536,220 @@ pub(crate) extern "system" fn create_compute(
     };
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
+        #[cfg(windows)]
+        None,
+        #[cfg(target_os = "macos")]
+        None,
+        iid,
+        out,
+    )
+}
+
+/// Device methods 0x1c8 and 0x218: a pipeline state from a console description whose layout is
+/// not known yet (`(desc, iid, out)`, the pipeline state's IID; title+0x2477578 and +0x24800d5).
+/// shortcut: the description is not read; the pipeline has no shaders, so draws with it are
+/// dropped.
+pub(crate) extern "system" fn create_unread_1c8(
+    _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    // `VICTORY_GUESS_GRAPHICS=1`: a pipeline from the pieces of the first slot, with the
+    // inferred state of `victory_shader::emit::graphics` and `native::state::Graphics::guessed`.
+    #[cfg(target_os = "macos")]
+    if !desc.is_null()
+        && std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some()
+        // SAFETY: the title passes a description of this layout.
+        && let Some(stages) = unsafe { graphics_containers(desc.add(8)) }
+    {
+        return hand_out(
+            stages,
+            Some(Box::new(crate::native::state::Graphics::guess_base())),
+            iid,
+            out,
+        );
+    }
+    if std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() && !desc.is_null() {
+        static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+            // SAFETY: a debugging read of the title's description.
+            let words: Vec<String> = (1..17).map(|i| format!("{:x}", unsafe { desc.cast::<u64>().add(i).read_unaligned() })).collect();
+            tracing::info!(?words, "a graphics description with no vertex shader piece");
+        }
+    }
+    create_unread_at(0x1c8, desc, iid, out)
+}
+
+/// The vertex and pixel shader containers of the slot at `slot` of a graphics description (pairs
+/// 4/5 and 2/3: code and metadata) as guessed pipelines have them; `None` when the slot lacks a
+/// vertex shader or a piece does not make a container.
+///
+/// # Safety
+/// `slot` points at a slot of eight (pointer, size) pairs.
+#[cfg(target_os = "macos")]
+unsafe fn graphics_containers(slot: *const u8) -> Option<Vec<Arc<Shader>>> {
+    use victory_shader::HwStage;
+    let piece = |pair: usize| -> Option<&[u8]> {
+        // SAFETY: as the caller says; the pieces are the title's, of the size it gives.
+        unsafe {
+            let ptr = slot.add(16 * pair).cast::<usize>().read_unaligned();
+            let size = slot.add(16 * pair + 8).cast::<usize>().read_unaligned();
+            (ptr != 0 && size != 0 && size <= 1 << 22)
+                .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
+        }
+    };
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container(stage, code, meta) {
+        Ok(c) => Some(shader(name, &c)),
+        Err(e) => {
+            tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
+            None
+        }
+    };
+    // The vertex shader is pair 4/5, or pair 6/7 when that is empty (observed; the pairs vary).
+    let (code, meta) = match (piece(4), piece(5)) {
+        (Some(code), Some(meta)) => (code, meta),
+        _ => (piece(6)?, piece(7)?),
+    };
+    let vs = make(HwStage::Vs, "vertex", code, meta)?;
+    let mut shaders = vec![vs];
+    if let (Some(code), Some(meta)) = (piece(2), piece(3)) {
+        shaders.push(make(HwStage::Ps, "pixel", code, meta)?);
+    }
+    Some(shaders)
+}
+
+/// Device method 0x218: a compute pipeline. The description is a root signature pointer and one
+/// 0x60-byte record, the pieces an `FSPX` part is made of (observed at run time, as the console
+/// runtime takes them): pointer and size of the pipeline registers (kind 0, 0x1c bytes), of the
+/// hash (kind 1, 0x14), of the GFX10 code (kind 6) and of the metadata (kind 7); more fields
+/// follow that are not read.
+pub(crate) extern "system" fn create_compute_pieces(
+    _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if desc.is_null() {
+        return E_INVALIDARG;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the title passes a description of this layout.
+        if let Some(container) = unsafe { compute_container(desc.add(8)) } {
+            return hand_out(
+                vec![shader("compute", &container)],
+                #[cfg(windows)]
+                None,
+                None,
+                iid,
+                out,
+            );
+        }
+    }
+    create_unread_at(0x218, desc, iid, out)
+}
+
+/// A container with the `ACCC` part of the pieces at `record` (see [`create_compute_pieces`]).
+///
+/// # Safety
+/// `record` points at four (pointer, size) pairs.
+#[cfg(target_os = "macos")]
+unsafe fn compute_container(record: *const u8) -> Option<Vec<u8>> {
+    const KINDS: [u32; 4] = [0, 1, 6, 7];
+    let mut part = vec![0u8; 0x10 + 16 * KINDS.len()];
+    for (i, kind) in KINDS.into_iter().enumerate() {
+        // SAFETY: as the caller says.
+        let (ptr, size) = unsafe {
+            (
+                record.add(16 * i).cast::<usize>().read_unaligned(),
+                record.add(16 * i + 8).cast::<usize>().read_unaligned(),
+            )
+        };
+        if ptr == 0 || size == 0 || size > 1 << 22 {
+            return None;
+        }
+        let at = part.len().next_multiple_of(16);
+        part.resize(at, 0);
+        let entry: Vec<u8> = [kind, at as u32, size as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+        part[0x10 + 16 * i..0x20 + 16 * i].copy_from_slice(&entry);
+        // SAFETY: the title's piece of `size` bytes.
+        part.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr as *const u8, size) });
+    }
+    let header: Vec<u8> = [u32::from_le_bytes(*b"FSPX"), 1, KINDS.len() as u32, part.len() as u32]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    part[..16].copy_from_slice(&header);
+    Some(victory_shader::dxbc::build(&[(victory_shader::FourCC::ACCC, &part)]))
+}
+
+/// Debugging (`VICTORY_DUMP_DESC=1`): the first descriptions of each slot, with the bytes behind
+/// every (pointer, length) pair in them, to stderr.
+fn dump_description(slot: usize, desc: *const u8) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let n = COUNTS[usize::from(slot == 0x218)].fetch_add(1, Ordering::Relaxed);
+    if n >= 50 {
+        return;
+    }
+    // SAFETY: a debugging read of the title's description and of what it points at.
+    unsafe {
+        let words: Vec<u64> = (0..192).map(|i| desc.cast::<u64>().add(i).read_unaligned()).collect();
+        eprintln!("DESC {slot:#x} #{n}");
+        for (i, w) in words.chunks(4).enumerate() {
+            eprintln!("  +{:#05x} {:016x} {:016x} {:016x} {:016x}", i * 32, w[0], w[1], w[2], w[3]);
+        }
+        if std::env::var_os("VICTORY_DUMP_STATE").is_some() && n < 6 {
+            // The block of host pointers at the end of each stage slot: what each points at.
+            for w in [0x110usize, 0x118, 0x128, 0x130] {
+                let p = words[(8 + w) / 8];
+                let q = p & 0xffff_ffff;
+                for (tag, p) in [("full", p), ("low32", q)] {
+                    if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) || (tag == "low32" && p > 0x10000) {
+                        let bytes = std::slice::from_raw_parts(p as *const u8, 0x100);
+                        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                        eprintln!("  STATEPTR slot0+{w:#x} {tag} {p:#x} {hex}");
+                    }
+                }
+            }
+        }
+        for i in 0..191 {
+            let (p, len) = (words[i], words[i + 1]);
+            if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) && len > 0 && len <= 0x4000 {
+                let bytes = std::slice::from_raw_parts(p as *const u8, (len as usize).min(if n < 3 { 0x1000 } else { 48 }));
+                if let Some(dir) = std::env::var_os("VICTORY_DUMP_DESC_DIR")
+                    && n < 12
+                {
+                    let all = std::slice::from_raw_parts(p as *const u8, len as usize);
+                    let _ = std::fs::write(
+                        std::path::Path::new(&dir).join(format!("{slot:x}_{n}_{:03x}.bin", i * 8)),
+                        all,
+                    );
+                }
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("  BLOB +{:#x} ptr={p:#x} len={len:#x} {hex}", i * 8);
+            }
+        }
+    }
+}
+
+fn create_unread_at(
+    slot: usize,
+    _desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() {
+        tracing::info!(slot, "a pipeline created without shaders");
+    }
+    if std::env::var_os("VICTORY_DUMP_DESC").is_some() && !_desc.is_null() {
+        dump_description(slot, _desc);
+    }
+    hand_out(
+        Vec::new(),
         #[cfg(windows)]
         None,
         #[cfg(target_os = "macos")]
@@ -549,6 +827,9 @@ pub(crate) extern "system" fn create_stream(
     }
     // SAFETY: the title passes a whole stream.
     let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
+    if std::env::var_os("VICTORY_TRACE_STREAM").is_some() {
+        trace_stream(stream);
+    }
     #[allow(unused_variables)]
     let (shaders, graphics) = read_stream(stream, copy);
     hand_out(
@@ -560,6 +841,28 @@ pub(crate) extern "system" fn create_stream(
         iid,
         out,
     )
+}
+
+/// Debugging (`VICTORY_TRACE_STREAM=1`): each distinct sequence of subobject types, with the
+/// first stream that had it in full.
+fn trace_stream(stream: &[u8]) {
+    static SEEN: std::sync::Mutex<Vec<Vec<u32>>> = std::sync::Mutex::new(Vec::new());
+    let mut kinds = Vec::new();
+    let mut at = 0;
+    while at + 8 <= stream.len() {
+        let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
+        kinds.push(kind);
+        match subobject(kind) {
+            Some((size, _)) => at += size,
+            None => break,
+        }
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 40 && !seen.contains(&kinds) {
+        let hex: String = stream.iter().take(0x300).map(|b| format!("{b:02x}")).collect();
+        eprintln!("STREAM kinds={kinds:?} size={:#x} {hex}", stream.len());
+        seen.push(kinds);
+    }
 }
 
 #[cfg(windows)]
@@ -947,5 +1250,39 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod pieces_tests {
+    use super::*;
+
+    /// Four (pointer, size) pairs of a console compute description's record, as the title lays
+    /// them out: registers, hash, code, metadata.
+    #[test]
+    fn a_record_becomes_an_fspx_part_in_a_container() {
+        let pieces: [Vec<u8>; 4] = [vec![1; 0x1c], vec![2; 0x14], vec![3; 0x40], vec![4; 0x60]];
+        let mut record = Vec::new();
+        for p in &pieces {
+            record.extend((p.as_ptr() as u64).to_le_bytes());
+            record.extend((p.len() as u64).to_le_bytes());
+        }
+        // SAFETY: four pairs over live vectors.
+        let container = unsafe { compute_container(record.as_ptr()) }.expect("a container");
+        let parsed = victory_shader::Container::parse(&container).unwrap();
+        let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part").data;
+        let word = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap()) as usize;
+        assert_eq!(&part[..4], b"FSPX");
+        assert_eq!((word(4), word(8), word(12)), (1, 4, part.len()));
+        for (i, (kind, piece)) in [0u32, 1, 6, 7].into_iter().zip(&pieces).enumerate() {
+            let at = 0x10 + 16 * i;
+            assert_eq!(word(at), kind as usize);
+            let (offset, size) = (word(at + 4), word(at + 8));
+            assert_eq!(&part[offset..offset + size], &piece[..]);
+        }
+        // A missing piece is no container.
+        record[16..24].copy_from_slice(&0u64.to_le_bytes());
+        // SAFETY: as above.
+        assert!(unsafe { compute_container(record.as_ptr()) }.is_none());
     }
 }

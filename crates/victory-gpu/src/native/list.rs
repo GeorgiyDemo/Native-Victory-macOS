@@ -38,6 +38,12 @@ pub struct Binding {
     /// The shader finds title memory through the page table (`t0` of the memory space), which
     /// follows the views in the argument buffer, and the heap's reserved view pairs.
     pub memory: bool,
+    /// The pixel stage's own arguments, when the pipeline has a pixel shader that reads any
+    /// (a stage has an argument block of its own; this one is the vertex stage's).
+    pub ps: Option<Rc<Binding>>,
+    /// Some user data takes the heap index of a view of a root view's buffer (and the address's
+    /// offset in it): the heap needs the view pairs.
+    pub root_views: bool,
 }
 
 /// A root view's kind.
@@ -61,6 +67,11 @@ impl Binding {
                 .chain(shader.root_uavs.iter().map(|&r| (r, View::Uav)))
                 .collect(),
             memory: shader.memory,
+            ps: None,
+            root_views: shader.user_data.iter().any(|u| {
+                u.root == victory_shader::RootType::Descriptor
+                    && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
+            }),
         }
     }
 
@@ -492,6 +503,11 @@ impl<B: GraphicsBackend> NativeList<B> {
             self.state.vertex.resize(slot + 1, 0);
         }
         self.state.vertex[slot] = address;
+    }
+
+    /// The address bound as vertex buffer `slot`, if any (for the target trace).
+    pub fn vertex_buffer_address(&self, slot: usize) -> Option<u64> {
+        self.state.vertex.get(slot).copied()
     }
 
     pub fn set_index_buffer(&mut self, address: u64, wide: bool) {

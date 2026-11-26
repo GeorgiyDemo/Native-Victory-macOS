@@ -691,6 +691,13 @@ extern "system" fn present(
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if frame <= 4 {
+        tracing::info!(frame, "PresentX");
+    }
+    #[cfg(target_os = "macos")]
+    if frame % 64 == 0 {
+        crate::native::glue::log_draw_counts(frame);
+    }
     #[cfg(windows)]
     account_frame(frame);
     #[cfg(feature = "diagnostics")]

@@ -35,10 +35,10 @@ pub mod unwind;
 
 mod dispatch;
 #[cfg(target_arch = "x86_64")]
-mod signal;
+pub mod signal;
 
 pub use dispatch::{
-    Handler, add_vectored_handler, raise_record, remove_vectored_handler, set_unhandled_filter,
+    Handler, add_vectored_handler, backtrace, raise_record, remove_vectored_handler, set_unhandled_filter,
 };
 #[cfg(target_arch = "x86_64")]
 pub use signal::install;

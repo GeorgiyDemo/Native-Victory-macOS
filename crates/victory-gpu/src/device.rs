@@ -422,8 +422,14 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    #[cfg(target_os = "macos")]
+    {
+        f[55] = crate::variant::create_variant as *const (); // 0x1b8, see native::console_state
+    }
+    f[57] = pipeline::create_unread_1c8 as *const (); // 0x1c8, see 0x218
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = pipeline::create_compute_pieces as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238

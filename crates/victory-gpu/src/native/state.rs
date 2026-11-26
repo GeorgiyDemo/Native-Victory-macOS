@@ -70,6 +70,20 @@ pub struct Graphics {
     rt_formats: Vec<u32>,
     depth_format: u32,
     pub samples: u32,
+    /// The formats of the targets bound at the draw, for pipelines whose description has none
+    /// (the console's; see [`Graphics::with_targets`]).
+    bound: Option<(Vec<Format>, Option<Format>)>,
+    /// A guessed pipeline (`VICTORY_GUESS_GRAPHICS`, [`Graphics::guess_base`]): its vertex layout
+    /// and strides come from the draw ([`Graphics::for_draw`]).
+    guess: Option<Guess>,
+}
+
+/// What a draw gives a guessed pipeline that the description does not.
+#[derive(Clone, Debug, PartialEq, Default)]
+struct Guess {
+    strides: Vec<u32>,
+    /// A rectangle-list draw: every attribute is read for three corners, one instance a rectangle.
+    rect: bool,
 }
 
 impl Default for Graphics {
@@ -93,6 +107,8 @@ impl Default for Graphics {
             rt_formats: Vec::new(),
             depth_format: 0,
             samples: 1,
+            bound: None,
+            guess: None,
         }
     }
 }
@@ -209,6 +225,62 @@ impl Graphics {
         }
     }
 
+    /// The state of a pipeline made by device slot 0x1c8, whose description has none
+    /// (docs/native-host.md, "Guessed graphics pipelines"): no blend, no culling, depth test
+    /// less-equal with writes. Variants made by slot 0x1b8 apply their records over it.
+    pub fn guess_base() -> Graphics {
+        Graphics { cull: 1, depth_func: 4, guess: Some(Guess::default()), ..Graphics::default() }
+    }
+
+    /// This guessed state for a draw: the targets and vertex strides bound, and the input
+    /// elements the vertex shader's `VB<kind><n>` semantics are (`reads`, as [`vertex_inputs`]
+    /// gives them; index: corner << 28 | slot << 16 | byte offset, corner 0 unless `rect`).
+    pub fn for_draw(
+        &self,
+        colors: Vec<Format>,
+        depth: Option<Format>,
+        strides: Vec<u32>,
+        reads: &[(String, u32)],
+        rect: bool,
+    ) -> Graphics {
+        let mut g = self.clone().with_targets(colors, depth);
+        g.inputs.clear();
+        for (name, index) in reads {
+            let Some((format, _)) = guessed_vertex_format(name) else {
+                continue;
+            };
+            let (corner, slot) = (index >> 28, (index >> 16 & 0xfff).min(31));
+            let stride = strides.get(slot as usize).copied().unwrap_or(0);
+            g.inputs.push(Input {
+                name: name.clone(),
+                index: *index,
+                format,
+                slot,
+                offset: (index & 0xffff) + corner * stride,
+                per_instance: rect,
+            });
+        }
+        g.guess = Some(Guess { strides, rect });
+        g
+    }
+
+    /// Whether this is a guessed state, to be made at the first draw.
+    pub fn is_guessed(&self) -> bool {
+        self.guess.is_some()
+    }
+
+    /// Whether the state names the targets' formats (a stream's does, the console's does not).
+    pub fn names_targets(&self) -> bool {
+        !self.rt_formats.is_empty() || self.depth_format != 0
+    }
+
+    /// This state for a draw into the given targets: the console's pipelines name no formats, the
+    /// draw's bound targets do.
+    pub fn with_targets(mut self, color: Vec<Format>, depth: Option<Format>) -> Self {
+        self.bound = Some((color, depth));
+        self
+    }
+
     /// The input elements, in the title's order.
     pub fn inputs(&self) -> &[Input] {
         &self.inputs
@@ -216,11 +288,17 @@ impl Graphics {
 
     /// The colour target formats the host knows; `None` if one is not (the pipeline is refused).
     pub fn color_formats(&self) -> Option<Vec<Format>> {
+        if let Some((color, _)) = &self.bound {
+            return Some(color.clone());
+        }
         self.rt_formats.iter().map(|&f| format(f)).collect()
     }
 
     /// The depth format; `Ok(None)` for no depth target, `Err` if the host does not know it.
     pub fn depth_format(&self) -> Result<Option<Format>, u32> {
+        if let Some((_, depth)) = &self.bound {
+            return Ok(*depth);
+        }
         match self.depth_format {
             0 => Ok(None),
             f => format(f).map(Some).ok_or(f),
@@ -240,15 +318,25 @@ impl Graphics {
                 .inputs
                 .iter()
                 .find(|e| e.name.eq_ignore_ascii_case(name) && e.index == *index)?;
+            let format = vertex_format(e.format)
+                .or_else(|| self.guess.as_ref().and_then(|_| guessed_vertex_format(&e.name).map(|(_, f)| f)))?;
             attributes.push(VertexAttr {
-                format: vertex_format(e.format)?,
+                format,
                 slot: e.slot as usize,
                 offset: e.offset as usize,
             });
         }
         let mut streams: Vec<VertexStream> = Vec::new();
         for e in &self.inputs {
-            let end = (e.offset + crate::resource::element(e.format).map_or(0, |(b, _)| b as u32)) as usize;
+            let bytes = crate::resource::element(e.format)
+                .map(|(b, _)| b as u32)
+                .or_else(|| {
+                    self.guess
+                        .as_ref()
+                        .and_then(|_| guessed_vertex_format(&e.name).map(|(_, f)| f.byte_size() as u32))
+                })
+                .unwrap_or(0);
+            let end = (e.offset + bytes) as usize;
             match streams.iter_mut().find(|s| s.slot == e.slot as usize) {
                 Some(s) => s.stride = s.stride.max(end),
                 None => streams.push(VertexStream {
@@ -260,6 +348,14 @@ impl Graphics {
         }
         for s in &mut streams {
             s.stride = s.stride.next_multiple_of(4);
+            // A guessed pipeline's streams have the strides of the buffers bound.
+            if let Some(&bound) = self.guess.as_ref().and_then(|g| g.strides.get(s.slot)) {
+                s.stride = if self.guess.as_ref().is_some_and(|g| g.rect) {
+                    3 * bound as usize
+                } else {
+                    s.stride.max(bound as usize)
+                };
+            }
         }
         Some((attributes, streams))
     }
@@ -267,7 +363,8 @@ impl Graphics {
     /// Blend and write mask of each colour target (target 0's description for all when the blend
     /// description is not independent).
     pub fn color_state(&self) -> Vec<ColorState> {
-        (0..self.rt_formats.len().max(1))
+        let targets = self.bound.as_ref().map_or(self.rt_formats.len(), |b| b.0.len());
+        (0..targets.max(1))
             .map(|i| {
                 let t = &self.blend[if self.independent { i } else { 0 }];
                 ColorState {
@@ -385,6 +482,61 @@ pub fn stencil_op(o: u32) -> StencilOp {
     }
 }
 
+/// A guessed vertex semantic `VB<tag><n>` as `(dxgi, VertexFormat)`.
+/// `dxgi` is `0` for `VBT4` (`Snorm1010102`), which matches GFX10 `2_10_10_10` snorm and Metal's
+/// `Int1010102Normalized` but has no PC DXGI format number.
+fn guessed_vertex_format(name: &str) -> Option<(u32, VertexFormat)> {
+    let [b'V', b'B', tag, ch] = name.as_bytes() else {
+        return None;
+    };
+    let (dxgi, fmt) = match (tag, ch) {
+        (b'F', b'1') => (41, VertexFormat::Float),
+        (b'F', b'2') => (16, VertexFormat::Float2),
+        (b'F', b'3') => (6, VertexFormat::Float3),
+        (b'F', b'4') => (2, VertexFormat::Float4),
+        (b'U', b'1') => (42, VertexFormat::Uint),
+        (b'U', b'2') => (17, VertexFormat::Uint2),
+        (b'U', b'3') => (7, VertexFormat::Uint3),
+        (b'U', b'4') => (3, VertexFormat::Uint4),
+        (b'I', b'1') => (43, VertexFormat::Sint),
+        (b'I', b'2') => (18, VertexFormat::Sint2),
+        (b'I', b'3') => (8, VertexFormat::Sint3),
+        (b'I', b'4') => (4, VertexFormat::Sint4),
+        (b'H', b'1') => (54, VertexFormat::Half),
+        (b'H', b'2') => (34, VertexFormat::Half2),
+        (b'H', b'4') => (10, VertexFormat::Half4),
+        (b'M', b'1') => (56, VertexFormat::Unorm16),
+        (b'M', b'2') => (35, VertexFormat::Unorm16x2),
+        (b'M', b'4') => (11, VertexFormat::Unorm16x4),
+        (b'S', b'1') => (58, VertexFormat::Snorm16),
+        (b'S', b'2') => (37, VertexFormat::Snorm16x2),
+        (b'S', b'4') => (13, VertexFormat::Snorm16x4),
+        (b'W', b'1') => (57, VertexFormat::Uint16),
+        (b'W', b'2') => (36, VertexFormat::Uint16x2),
+        (b'W', b'4') => (12, VertexFormat::Uint16x4),
+        (b'K', b'1') => (59, VertexFormat::Sint16),
+        (b'K', b'2') => (38, VertexFormat::Sint16x2),
+        (b'K', b'4') => (14, VertexFormat::Sint16x4),
+        (b'N', b'1') => (61, VertexFormat::Unorm8),
+        (b'N', b'2') => (49, VertexFormat::Unorm8x2),
+        (b'N', b'4') => (28, VertexFormat::Unorm8x4),
+        (b'Q', b'1') => (63, VertexFormat::Snorm8),
+        (b'Q', b'2') => (51, VertexFormat::Snorm8x2),
+        (b'Q', b'4') => (31, VertexFormat::Snorm8x4),
+        (b'B', b'1') => (62, VertexFormat::Uint8),
+        (b'B', b'2') => (50, VertexFormat::Uint8x2),
+        (b'B', b'4') => (30, VertexFormat::Uint8x4),
+        (b'C', b'1') => (64, VertexFormat::Sint8),
+        (b'C', b'2') => (52, VertexFormat::Sint8x2),
+        (b'C', b'4') => (32, VertexFormat::Sint8x4),
+        (b'P', b'4') => (24, VertexFormat::Unorm1010102),
+        (b'T', b'4') => (0, VertexFormat::Snorm1010102),
+        (b'G', b'3') => (26, VertexFormat::FloatRG11B10),
+        _ => return None,
+    };
+    Some((dxgi, fmt))
+}
+
 /// An input element's DXGI format (PC numbering) as a vertex format.
 pub fn vertex_format(dxgi: u32) -> Option<VertexFormat> {
     Some(match dxgi {
@@ -393,7 +545,42 @@ pub fn vertex_format(dxgi: u32) -> Option<VertexFormat> {
         6 => VertexFormat::Float3,
         2 => VertexFormat::Float4,
         42 => VertexFormat::Uint,
+        17 => VertexFormat::Uint2,
+        7 => VertexFormat::Uint3,
+        3 => VertexFormat::Uint4,
+        43 => VertexFormat::Sint,
+        18 => VertexFormat::Sint2,
+        8 => VertexFormat::Sint3,
+        4 => VertexFormat::Sint4,
+        54 => VertexFormat::Half,
+        34 => VertexFormat::Half2,
+        10 => VertexFormat::Half4,
+        56 => VertexFormat::Unorm16,
+        35 => VertexFormat::Unorm16x2,
+        11 => VertexFormat::Unorm16x4,
+        58 => VertexFormat::Snorm16,
+        37 => VertexFormat::Snorm16x2,
+        13 => VertexFormat::Snorm16x4,
+        57 => VertexFormat::Uint16,
+        36 => VertexFormat::Uint16x2,
+        12 => VertexFormat::Uint16x4,
+        59 => VertexFormat::Sint16,
+        38 => VertexFormat::Sint16x2,
+        14 => VertexFormat::Sint16x4,
+        61 => VertexFormat::Unorm8,
+        49 => VertexFormat::Unorm8x2,
         28 => VertexFormat::Unorm8x4,
+        63 => VertexFormat::Snorm8,
+        51 => VertexFormat::Snorm8x2,
+        31 => VertexFormat::Snorm8x4,
+        62 => VertexFormat::Uint8,
+        50 => VertexFormat::Uint8x2,
+        30 => VertexFormat::Uint8x4,
+        64 => VertexFormat::Sint8,
+        52 => VertexFormat::Sint8x2,
+        32 => VertexFormat::Sint8x4,
+        24 => VertexFormat::Unorm1010102,
+        26 => VertexFormat::FloatRG11B10,
         _ => return None,
     })
 }
@@ -432,6 +619,40 @@ pub fn vertex_inputs(dxil: &[u8]) -> Option<Vec<(String, u32)>> {
         reads.push((String::from_utf8_lossy(&tail[..end]).into_owned(), index));
     }
     Some(reads)
+}
+
+/// The `TEXCOORD` indices of a translated shader's `ISG1` (inputs) or `OSG1` (outputs) as a mask.
+pub fn texcoords(dxil: &[u8], fourcc: victory_shader::FourCC) -> u32 {
+    use victory_shader::Container;
+    let Some(part) = Container::parse(dxil).ok().and_then(|c| c.part(fourcc).map(|p| p.data.to_vec())) else {
+        return 0;
+    };
+    let word = |at: usize| part.get(at..at + 4).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
+    let mut mask = 0;
+    for i in 0..word(0) as usize {
+        let at = 8 + 32 * i;
+        let name = part.get(word(at + 4) as usize..).and_then(|t| t.split(|&b| b == 0).next()).unwrap_or(&[]);
+        if name == b"TEXCOORD" && word(at + 12) == 0 && word(at + 8) < 32 {
+            mask |= 1 << word(at + 8);
+        }
+    }
+    mask
+}
+
+/// The positions of the system values in a vertex shader's input signature that come before its
+/// last attribute. The converter numbers the stage-in attributes by signature position, system
+/// values included, so these positions are attribute slots no element fills.
+pub fn system_gaps(dxil: &[u8]) -> Vec<usize> {
+    use victory_shader::{Container, FourCC};
+    let Some(part) = Container::parse(dxil).ok().and_then(|c| c.part(FourCC::ISG1).map(|p| p.data.to_vec())) else {
+        return Vec::new();
+    };
+    let count = part.get(..4).map_or(0, |c| u32::from_le_bytes(c.try_into().unwrap()) as usize);
+    let system: Vec<bool> = (0..count)
+        .map(|i| part.get(8 + 32 * i + 12..8 + 32 * i + 16).is_some_and(|w| w != [0; 4]))
+        .collect();
+    let last = system.iter().rposition(|s| !s).unwrap_or(0);
+    (0..last).filter(|&i| system[i]).collect()
 }
 
 #[cfg(test)]
@@ -549,11 +770,139 @@ mod tests {
     }
 
     #[test]
+    fn a_rectangle_list_reads_three_corners_per_instance() {
+        // One float3 at slot 0 offset 0 of a 24-byte vertex, read at corners 0 to 2.
+        let reads: Vec<(String, u32)> = (0..3).map(|c| ("VBF3".to_owned(), c << 28)).collect();
+        let g = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![24], &reads, true);
+        let (attrs, streams) = g.vertex_layout(&reads).unwrap();
+        assert_eq!(attrs.iter().map(|a| a.offset).collect::<Vec<_>>(), [0, 24, 48]);
+        assert_eq!((streams[0].stride, streams[0].per_instance), (72, true));
+    }
+
+    #[test]
     fn topologies_map_and_the_rest_are_refused() {
         assert_eq!(topology(4), Some(Topology::Triangles));
         assert_eq!(topology(3), Some(Topology::LineStrip));
         assert_eq!(topology(5), Some(Topology::TriangleStrip));
         // Adjacency, patches, the console's rectangle lists.
         assert_eq!([6, 33, 35, 100].map(topology), [None; 4]);
+    }
+
+    #[test]
+    fn guessed_vertex_formats_cover_all_supported_tags_and_widths() {
+        let cases = [
+            ("VBF1", 41, VertexFormat::Float, 4),
+            ("VBF2", 16, VertexFormat::Float2, 8),
+            ("VBF3", 6, VertexFormat::Float3, 12),
+            ("VBF4", 2, VertexFormat::Float4, 16),
+            ("VBU1", 42, VertexFormat::Uint, 4),
+            ("VBU2", 17, VertexFormat::Uint2, 8),
+            ("VBU3", 7, VertexFormat::Uint3, 12),
+            ("VBU4", 3, VertexFormat::Uint4, 16),
+            ("VBI1", 43, VertexFormat::Sint, 4),
+            ("VBI2", 18, VertexFormat::Sint2, 8),
+            ("VBI3", 8, VertexFormat::Sint3, 12),
+            ("VBI4", 4, VertexFormat::Sint4, 16),
+            ("VBH1", 54, VertexFormat::Half, 2),
+            ("VBH2", 34, VertexFormat::Half2, 4),
+            ("VBH4", 10, VertexFormat::Half4, 8),
+            ("VBM1", 56, VertexFormat::Unorm16, 2),
+            ("VBM2", 35, VertexFormat::Unorm16x2, 4),
+            ("VBM4", 11, VertexFormat::Unorm16x4, 8),
+            ("VBS1", 58, VertexFormat::Snorm16, 2),
+            ("VBS2", 37, VertexFormat::Snorm16x2, 4),
+            ("VBS4", 13, VertexFormat::Snorm16x4, 8),
+            ("VBW1", 57, VertexFormat::Uint16, 2),
+            ("VBW2", 36, VertexFormat::Uint16x2, 4),
+            ("VBW4", 12, VertexFormat::Uint16x4, 8),
+            ("VBK1", 59, VertexFormat::Sint16, 2),
+            ("VBK2", 38, VertexFormat::Sint16x2, 4),
+            ("VBK4", 14, VertexFormat::Sint16x4, 8),
+            ("VBN1", 61, VertexFormat::Unorm8, 1),
+            ("VBN2", 49, VertexFormat::Unorm8x2, 2),
+            ("VBN4", 28, VertexFormat::Unorm8x4, 4),
+            ("VBQ1", 63, VertexFormat::Snorm8, 1),
+            ("VBQ2", 51, VertexFormat::Snorm8x2, 2),
+            ("VBQ4", 31, VertexFormat::Snorm8x4, 4),
+            ("VBB1", 62, VertexFormat::Uint8, 1),
+            ("VBB2", 50, VertexFormat::Uint8x2, 2),
+            ("VBB4", 30, VertexFormat::Uint8x4, 4),
+            ("VBC1", 64, VertexFormat::Sint8, 1),
+            ("VBC2", 52, VertexFormat::Sint8x2, 2),
+            ("VBC4", 32, VertexFormat::Sint8x4, 4),
+            ("VBP4", 24, VertexFormat::Unorm1010102, 4),
+            ("VBT4", 0, VertexFormat::Snorm1010102, 4),
+            ("VBG3", 26, VertexFormat::FloatRG11B10, 4),
+        ];
+        for (name, dxgi, expected, bytes) in cases {
+            assert_eq!(expected.byte_size(), bytes, "{name}");
+            if dxgi != 0 {
+                assert_eq!(vertex_format(dxgi), Some(expected), "{name} dxgi {dxgi}");
+                assert_eq!(crate::resource::element(dxgi), Some((bytes as u64, 1)), "{name} element");
+            }
+            let reads = [(name.to_owned(), 0u32)];
+            let g = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &reads, false);
+            let (attrs, streams) = g.vertex_layout(&reads).unwrap_or_else(|| panic!("layout for {name}"));
+            assert_eq!(attrs.len(), 1);
+            assert_eq!(attrs[0].format, expected, "{name}");
+            assert_eq!(streams[0].stride, bytes.next_multiple_of(4), "{name}");
+        }
+
+        // Unknown tags, invalid channel counts, and non-VB semantics must be refused.
+        for bad in ["VBF0", "VBF5", "VBU0", "VBU5", "VBH3", "VBM3", "VBN3", "VBP3", "VBT3", "VBG4", "VBX4", "FOO4", "VBF40"] {
+            let reads = [(bad.to_owned(), 0u32)];
+            let g = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &reads, false);
+            assert!(g.vertex_layout(&reads).is_none(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn explicit_input_layouts_support_packed_and_narrow_vertex_formats() {
+        let names = [c"POS", c"NORM", c"TAN", c"UV", c"JOINTS"];
+        let el = |n: usize, format: u32, offset: u32| {
+            let mut e = [0u8; 32];
+            e[..8].copy_from_slice(&(names[n].as_ptr() as u64).to_le_bytes());
+            for (k, w) in [0, format, 0, offset, 0, 0].into_iter().enumerate() {
+                e[8 + 4 * k..12 + 4 * k].copy_from_slice(&u32::to_le_bytes(w));
+            }
+            e
+        };
+        let mut elements = Vec::new();
+        for e in [
+            el(0, 10, 0),            // R16G16B16A16_FLOAT (8 bytes -> 0..8)
+            el(1, 24, u32::MAX),     // R10G10B10A2_UNORM (4 bytes -> 8..12)
+            el(2, 26, u32::MAX),     // R11G11B10_FLOAT (4 bytes -> 12..16)
+            el(3, 37, u32::MAX),     // R16G16_SNORM (4 bytes -> 16..20)
+            el(4, 30, u32::MAX),     // R8G8B8A8_UINT (4 bytes -> 20..24)
+        ] {
+            elements.extend(e);
+        }
+        let mut s = 12u32.to_le_bytes().to_vec();
+        s.extend([0; 4]);
+        s.extend((elements.as_ptr() as u64).to_le_bytes());
+        s.extend(5u32.to_le_bytes());
+        s.extend([0; 4]);
+        let mut g = Graphics::default();
+        // SAFETY: a whole input layout subobject over live elements and names.
+        unsafe { g.read(12, s.as_ptr()) };
+        let reads = [
+            ("POS".to_owned(), 0),
+            ("NORM".to_owned(), 0),
+            ("TAN".to_owned(), 0),
+            ("UV".to_owned(), 0),
+            ("JOINTS".to_owned(), 0),
+        ];
+        let (attrs, streams) = g.vertex_layout(&reads).unwrap();
+        assert_eq!(
+            attrs.iter().map(|a| (a.format, a.offset)).collect::<Vec<_>>(),
+            [
+                (VertexFormat::Half4, 0),
+                (VertexFormat::Unorm1010102, 8),
+                (VertexFormat::FloatRG11B10, 12),
+                (VertexFormat::Snorm16x2, 16),
+                (VertexFormat::Uint8x4, 20),
+            ]
+        );
+        assert_eq!(streams[0].stride, 24);
     }
 }

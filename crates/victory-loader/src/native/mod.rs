@@ -21,6 +21,8 @@ pub use image::{NativeImage, TlsTemplate};
 mod bind;
 #[cfg(target_arch = "x86_64")]
 pub mod bridge;
+#[cfg(target_arch = "x86_64")]
+pub mod dump;
 mod run;
 #[cfg(target_arch = "aarch64")]
 pub mod guest;
@@ -31,11 +33,11 @@ pub mod threadctl;
 pub use bind::bind_imports;
 #[cfg(target_arch = "x86_64")]
 pub use bridge::{
-    bridged_copy_of, bridged_table, call_win64, declare_direct, declare_win64, expose_object, host_callbacks,
-    is_bridged, is_title_code,
+    bridged_copy_of, bridged_table, call_win64, declare_direct, declare_win64, exit_title_thread,
+    expose_object, host_callbacks, is_bridged, is_title_code,
 };
 #[cfg(target_arch = "aarch64")]
-pub use guest::{call_win64, is_title_code};
+pub use guest::{call_win64, exit_title_thread, is_title_code};
 pub use run::{
     attach, attach_dll, disable_thread_calls, register_dll_thread_notices,
     register_thread_callbacks, run_entry, run_entry_with, spawn_title_thread,
