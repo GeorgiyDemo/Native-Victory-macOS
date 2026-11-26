@@ -125,7 +125,6 @@ fn map_dll(
     let image = NativeImage::map(&bytes, None).with_context(|| format!("mapping {name}"))?;
     drop(bytes);
     // Before any thread runs title code, and while its index word is writable.
-    #[cfg(target_arch = "x86_64")]
     if let Some(tls) = image.tls() {
         super::teb::register_tls(tls);
     }
