@@ -11,7 +11,7 @@ use super::runtime::bad_param;
 use super::{
     Ch, EINVAL, ERANGE, STRUNCATE, TRUNCATE, exports, leak_cstr, leak_wstr, libc, set_errno, units,
 };
-use victory_loader::native::call_win64;
+use crate::title::call_win64;
 
 // memory
 

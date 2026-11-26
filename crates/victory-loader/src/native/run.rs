@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use victory_platform::thread::{self, Thread};
 
-use super::bridge::call_win64;
+use super::call_win64;
 use super::image::NativeImage;
 use super::teb;
 use crate::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH};

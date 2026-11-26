@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use victory_recomp::image::Image;
@@ -109,7 +110,9 @@ struct Rt {
     set_fallback: SetFallback,
     unresolved_count: UnresolvedCount,
     cpuid: Cpuid,
+    bind: Bind,
 }
+type Bind = unsafe extern "C" fn(*const RtImport) -> u64;
 type CallGuest = unsafe extern "C" fn(u64, *const u64, u32, u32, *mut u64) -> u64;
 type ThreadInit = unsafe extern "C" fn(*mut u8, *mut u8, *mut u8);
 type SetFallback = unsafe extern "C" fn(unsafe extern "C" fn(*mut Cpu, u64));
@@ -127,6 +130,50 @@ pub fn call_guest(target: u64, args: &[u64], fmask: u32) -> (u64, u64) {
     // SAFETY: `target` is a guest function address; the runtime resolves it or reports it unresolved.
     let rax = unsafe { (rt.call_guest)(target, args.as_ptr(), args.len() as u32, fmask, &mut x0) };
     (rax, x0)
+}
+
+static IMAGE: AtomicUsize = AtomicUsize::new(0);
+static IMAGE_END: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether an image is loaded: until then there is no guest to hand a function or an object to.
+pub fn is_loaded() -> bool {
+    IMAGE.load(Ordering::Acquire) != 0
+}
+
+/// Whether `addr` is inside the loaded guest image: a callback pointer there is lifted code and must be
+/// called through [`call_guest`]; any other address is a function of ours.
+pub fn contains(addr: u64) -> bool {
+    (IMAGE.load(Ordering::Acquire) as u64..IMAGE_END.load(Ordering::Acquire) as u64).contains(&addr)
+}
+
+/// The runtime's thunk for a host function: the address lifted code calls (through an IAT slot, or from a
+/// pointer the title got from `GetProcAddress` or a method table). Needs a loaded host.
+pub fn import_thunk(name: &str, binding: Binding) -> Result<u64> {
+    let rt = RT.get().context("no host loaded")?;
+    let cname = CString::new(name)?;
+    let (func, raw, sig) = match binding {
+        Binding::Typed(f, s) => (f, None, parse_sig(s)?),
+        Binding::Raw(f) => (std::ptr::null(), Some(f), (0, 0, 0, 4)),
+    };
+    let desc = RtImport {
+        name: cname.as_ptr(),
+        func,
+        raw,
+        argc: sig.0,
+        fmask: sig.1,
+        smask: sig.2,
+        ret: sig.3,
+    };
+    // SAFETY: desc is valid for the call; the runtime copies it and the name.
+    Ok(unsafe { (rt.bind)(&desc) })
+}
+
+/// Gives the calling thread its TEB and guest stack (`stack_lo..stack_hi`): what `gs:` reads in lifted code.
+/// A thread that never calls it gets a private TEB on its first guest call. Needs a loaded host.
+pub fn thread_init(teb: *mut u8, stack_lo: *mut u8, stack_hi: *mut u8) {
+    let rt = RT.get().expect("no host loaded");
+    // SAFETY: the caller's TEB and stack outlive the thread's guest calls.
+    unsafe { (rt.thread_init)(teb, stack_lo, stack_hi) };
 }
 
 /// A mapped image with its runtime.
@@ -174,17 +221,12 @@ impl Host {
                     "rt_unresolved_count",
                 )?),
                 cpuid: std::mem::transmute::<*mut c_void, Cpuid>(sym("rt_cpuid")?),
+                bind: std::mem::transmute::<*mut c_void, Bind>(sym("rt_import_bind")?),
             }
         };
         // SAFETY: see above.
         let init = unsafe {
             std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut u8, u64)>(sym("rt_init")?)
-        };
-        // SAFETY: see above.
-        let bind = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const RtImport) -> u64>(sym(
-                "rt_import_bind",
-            )?)
         };
         if RT.set(rt).is_err() {
             bail!("a host is already loaded in this process");
@@ -217,6 +259,8 @@ impl Host {
         }
         // SAFETY: img/size describe the mapping just made.
         unsafe { init(img, size as u64) };
+        IMAGE.store(img as usize, Ordering::Release);
+        IMAGE_END.store(img as usize + size, Ordering::Release);
 
         // Imports: one runtime thunk per host function, written into the IAT slots.
         let by_name: HashMap<&str, &Import> = imports.iter().map(|i| (i.name, i)).collect();
@@ -238,22 +282,7 @@ impl Host {
                 let thunk = match thunks.get(name) {
                     Some(t) => *t,
                     None => {
-                        let cname = CString::new(name)?;
-                        let (func, raw, sig) = match imp.binding {
-                            Binding::Typed(f, s) => (f, None, parse_sig(s)?),
-                            Binding::Raw(f) => (std::ptr::null(), Some(f), (0, 0, 0, 4)),
-                        };
-                        let desc = RtImport {
-                            name: cname.as_ptr(),
-                            func,
-                            raw,
-                            argc: sig.0,
-                            fmask: sig.1,
-                            smask: sig.2,
-                            ret: sig.3,
-                        };
-                        // SAFETY: desc is valid for the call; the runtime copies it and the name.
-                        let t = unsafe { bind(&desc) };
+                        let t = import_thunk(name, imp.binding)?;
                         thunks.insert(name, t);
                         t
                     }

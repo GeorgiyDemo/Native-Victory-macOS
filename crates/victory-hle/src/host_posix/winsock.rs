@@ -1367,7 +1367,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     macro_rules! table {
         ($($($key:literal)|+ => $f:expr),* $(,)?) => {
             match name {
-                $($($key)|+ => Some($f as *const () as usize),)*
+                $($($key)|+ => Some(crate::fn_addr!($f)),)*
                 _ => None,
             }
         };

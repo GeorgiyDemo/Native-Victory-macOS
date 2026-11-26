@@ -188,7 +188,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
 /// Natively our functions run with the host's GS, so title code calls them
 /// through a bridge stub; elsewhere the address itself.
 fn title_callable(address: usize) -> *mut c_void {
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[cfg(target_os = "macos")]
     let address = crate::host_posix::fake_dll::bridged(address).unwrap_or(0);
     address as *mut c_void
 }
@@ -605,7 +605,7 @@ mod host {
     /// The system DLLs we serve (kernel32, the API sets, ucrt, ...) have no
     /// image here: they get a fake module handle, see `host_posix::fake_dll`.
     fn system_dll(name: &str) -> *mut c_void {
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        #[cfg(target_os = "macos")]
         if let Some(handle) = crate::host_posix::fake_dll::handle(name) {
             return handle;
         }
@@ -632,9 +632,9 @@ mod host {
 
     /// `C:\Windows\System32\<name>` for a fake module handle.
     fn system_path(_module: *mut c_void) -> Option<Vec<u16>> {
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        #[cfg(target_os = "macos")]
         return crate::host_posix::fake_dll::path(_module);
-        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        #[cfg(not(target_os = "macos"))]
         None
     }
 
@@ -656,7 +656,7 @@ mod host {
     }
 
     pub(super) fn set_last_error(_code: u32) {
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        #[cfg(target_os = "macos")]
         crate::host_posix::SetLastError(_code);
     }
 
@@ -677,7 +677,6 @@ mod host {
             {
                 return address as *mut c_void;
             }
-            #[cfg(target_arch = "x86_64")]
             if let Some(found) = crate::host_posix::fake_dll::proc_address(_module, symbol) {
                 return found;
             }
@@ -686,24 +685,24 @@ mod host {
     }
 
     pub(super) fn free_library(_module: *mut c_void) -> i32 {
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        #[cfg(target_os = "macos")]
         return i32::from(crate::host_posix::fake_dll::is_fake(_module));
-        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        #[cfg(not(target_os = "macos"))]
         0
     }
 
     pub(super) fn disable_thread_library_calls(_module: *mut c_void) -> i32 {
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        #[cfg(target_os = "macos")]
         {
             victory_loader::native::disable_thread_calls(_module as usize);
             1
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        #[cfg(not(target_os = "macos"))]
         0
     }
 
     pub(super) fn exit(code: i32) -> ! {
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        #[cfg(target_os = "macos")]
         crate::host_posix::ucrt::run_exit_handlers();
         std::process::exit(code)
     }

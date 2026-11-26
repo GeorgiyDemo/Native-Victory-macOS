@@ -858,6 +858,7 @@ dependencies = [
  "victory-loader",
  "victory-pe",
  "victory-platform",
+ "victory-rt",
  "windows",
  "windows-core",
  "windows-sys",

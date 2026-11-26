@@ -786,6 +786,12 @@ extern "system" fn register_reading(
     token(out)
 }
 
+/// `register_reading` takes a float by value (its slot's signature is not the arm64 host's default).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn note_methods() {
+    let _ = crate::fn_addr!(register_reading);
+}
+
 /// Device callbacks run on our poll thread when a device comes or goes.
 /// Enumeration reports the devices already there: blocking on the caller's
 /// thread before we return (the title registers holding a lock its callback
@@ -1124,7 +1130,7 @@ pub(crate) fn module() -> HleModule {
         // Titles import it by ordinal only.
         exports: vec![HleExport {
             name: "#1",
-            address: GameInputCreate as *const () as usize,
+            address: crate::fn_addr!(GameInputCreate),
         }],
     }
 }

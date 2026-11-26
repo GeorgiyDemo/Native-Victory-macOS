@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use super::{EINVAL, Shared, errno, errno_ptr, exports, leak_cstr, leak_wstr, libc, set_errno};
-use victory_loader::native::call_win64;
+use crate::title::call_win64;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())

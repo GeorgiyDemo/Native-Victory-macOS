@@ -51,11 +51,11 @@ fn check(args: &[f64], r: f64) -> f64 {
 
 macro_rules! unary {
     ($($d:ident, $f:ident => $e:expr;)*) => {$(
-        pub extern "win64" fn $d(x: f64) -> f64 {
+        pub extern "efiapi" fn $d(x: f64) -> f64 {
             let g: fn(f64) -> f64 = $e;
             check(&[x], g(x))
         }
-        pub extern "win64" fn $f(x: f32) -> f32 {
+        pub extern "efiapi" fn $f(x: f32) -> f32 {
             let g: fn(f64) -> f64 = $e;
             check(&[f64::from(x)], g(f64::from(x))) as f32
         }
@@ -65,11 +65,11 @@ macro_rules! unary {
 /// No `errno`: results that are always defined.
 macro_rules! plain {
     ($($d:ident, $f:ident => $e:expr;)*) => {$(
-        pub extern "win64" fn $d(x: f64) -> f64 {
+        pub extern "efiapi" fn $d(x: f64) -> f64 {
             let g: fn(f64) -> f64 = $e;
             g(x)
         }
-        pub extern "win64" fn $f(x: f32) -> f32 {
+        pub extern "efiapi" fn $f(x: f32) -> f32 {
             let g: fn(f64) -> f64 = $e;
             g(f64::from(x)) as f32
         }
@@ -78,11 +78,11 @@ macro_rules! plain {
 
 macro_rules! binary {
     ($($d:ident, $f:ident => $e:expr;)*) => {$(
-        pub extern "win64" fn $d(x: f64, y: f64) -> f64 {
+        pub extern "efiapi" fn $d(x: f64, y: f64) -> f64 {
             let g: fn(f64, f64) -> f64 = $e;
             check(&[x, y], g(x, y))
         }
-        pub extern "win64" fn $f(x: f32, y: f32) -> f32 {
+        pub extern "efiapi" fn $f(x: f32, y: f32) -> f32 {
             let g: fn(f64, f64) -> f64 = $e;
             check(&[f64::from(x), f64::from(y)], g(f64::from(x), f64::from(y))) as f32
         }
@@ -128,19 +128,19 @@ plain! {
     fabs, fabsf => f64::abs;
 }
 
-pub extern "win64" fn _j0(x: f64) -> f64 {
+pub extern "efiapi" fn _j0(x: f64) -> f64 {
     libm::j0(x)
 }
 
-pub extern "win64" fn _j1(x: f64) -> f64 {
+pub extern "efiapi" fn _j1(x: f64) -> f64 {
     libm::j1(x)
 }
 
-pub extern "win64" fn _y0(x: f64) -> f64 {
+pub extern "efiapi" fn _y0(x: f64) -> f64 {
     libm::y0(x)
 }
 
-pub extern "win64" fn _y1(x: f64) -> f64 {
+pub extern "efiapi" fn _y1(x: f64) -> f64 {
     libm::y1(x)
 }
 
@@ -154,11 +154,11 @@ binary! {
 
 macro_rules! simple2 {
     ($($d:ident, $f:ident => $e:expr;)*) => {$(
-        pub extern "win64" fn $d(x: f64, y: f64) -> f64 {
+        pub extern "efiapi" fn $d(x: f64, y: f64) -> f64 {
             let g: fn(f64, f64) -> f64 = $e;
             g(x, y)
         }
-        pub extern "win64" fn $f(x: f32, y: f32) -> f32 {
+        pub extern "efiapi" fn $f(x: f32, y: f32) -> f32 {
             let g: fn(f64, f64) -> f64 = $e;
             g(f64::from(x), f64::from(y)) as f32
         }
@@ -172,36 +172,36 @@ simple2! {
     fdim, fdimf => |x, y| if x.is_nan() || y.is_nan() { f64::NAN } else if x > y { x - y } else { 0.0 };
 }
 
-pub extern "win64" fn nextafter(x: f64, y: f64) -> f64 {
+pub extern "efiapi" fn nextafter(x: f64, y: f64) -> f64 {
     libm::nextafter(x, y)
 }
 
 /// `long double` is `double` on this ABI.
-pub extern "win64" fn nexttoward(x: f64, y: f64) -> f64 {
+pub extern "efiapi" fn nexttoward(x: f64, y: f64) -> f64 {
     nextafter(x, y)
 }
 
-pub extern "win64" fn nextafterf(x: f32, y: f32) -> f32 {
+pub extern "efiapi" fn nextafterf(x: f32, y: f32) -> f32 {
     libm::nextafterf(x, y)
 }
 
-pub extern "win64" fn nexttowardf(x: f32, y: f64) -> f32 {
+pub extern "efiapi" fn nexttowardf(x: f32, y: f64) -> f32 {
     libm::nextafterf(x, y as f32)
 }
 
-pub extern "win64" fn fma(x: f64, y: f64, z: f64) -> f64 {
+pub extern "efiapi" fn fma(x: f64, y: f64, z: f64) -> f64 {
     x.mul_add(y, z)
 }
 
-pub extern "win64" fn fmaf(x: f32, y: f32, z: f32) -> f32 {
+pub extern "efiapi" fn fmaf(x: f32, y: f32, z: f32) -> f32 {
     x.mul_add(y, z)
 }
 
-pub extern "win64" fn ldexp(x: f64, e: i32) -> f64 {
+pub extern "efiapi" fn ldexp(x: f64, e: i32) -> f64 {
     check(&[x], scalbn_(x, e))
 }
 
-pub extern "win64" fn ldexpf(x: f32, e: i32) -> f32 {
+pub extern "efiapi" fn ldexpf(x: f32, e: i32) -> f32 {
     check(&[f64::from(x)], scalbn_(f64::from(x), e)) as f32
 }
 
@@ -209,32 +209,32 @@ fn scalbn_(x: f64, e: i32) -> f64 {
     libm::scalbn(x, e)
 }
 
-pub extern "win64" fn scalbn(x: f64, e: i32) -> f64 {
+pub extern "efiapi" fn scalbn(x: f64, e: i32) -> f64 {
     scalbn_(x, e)
 }
 
-pub extern "win64" fn scalbnf(x: f32, e: i32) -> f32 {
+pub extern "efiapi" fn scalbnf(x: f32, e: i32) -> f32 {
     scalbn_(f64::from(x), e) as f32
 }
 
 /// `scalbln`'s exponent is a 32-bit `long` here.
-pub extern "win64" fn scalbln(x: f64, e: i32) -> f64 {
+pub extern "efiapi" fn scalbln(x: f64, e: i32) -> f64 {
     scalbn_(x, e)
 }
 
-pub extern "win64" fn scalblnf(x: f32, e: i32) -> f32 {
+pub extern "efiapi" fn scalblnf(x: f32, e: i32) -> f32 {
     scalbn_(f64::from(x), e) as f32
 }
 
-pub extern "win64" fn _scalb(x: f64, e: i32) -> f64 {
+pub extern "efiapi" fn _scalb(x: f64, e: i32) -> f64 {
     scalbn_(x, e)
 }
 
-pub extern "win64" fn ilogb(x: f64) -> i32 {
+pub extern "efiapi" fn ilogb(x: f64) -> i32 {
     libm::ilogb(x)
 }
 
-pub extern "win64" fn ilogbf(x: f32) -> i32 {
+pub extern "efiapi" fn ilogbf(x: f32) -> i32 {
     ilogb(f64::from(x))
 }
 
@@ -254,14 +254,14 @@ fn frexp_(x: f64) -> (f64, i32) {
     (m, e + bias)
 }
 
-pub extern "win64" fn frexp(x: f64, exp: *mut i32) -> f64 {
+pub extern "efiapi" fn frexp(x: f64, exp: *mut i32) -> f64 {
     let (m, e) = frexp_(x);
     // SAFETY: the title passes a valid pointer.
     unsafe { exp.write(e) };
     m
 }
 
-pub extern "win64" fn frexpf(x: f32, exp: *mut i32) -> f32 {
+pub extern "efiapi" fn frexpf(x: f32, exp: *mut i32) -> f32 {
     frexp(f64::from(x), exp) as f32
 }
 
@@ -273,14 +273,14 @@ fn modf_(x: f64) -> (f64, f64) {
     ((x - i).copysign(x), i)
 }
 
-pub extern "win64" fn modf(x: f64, int: *mut f64) -> f64 {
+pub extern "efiapi" fn modf(x: f64, int: *mut f64) -> f64 {
     let (f, i) = modf_(x);
     // SAFETY: the title passes a valid pointer.
     unsafe { int.write(i) };
     f
 }
 
-pub extern "win64" fn modff(x: f32, int: *mut f32) -> f32 {
+pub extern "efiapi" fn modff(x: f32, int: *mut f32) -> f32 {
     let (f, i) = modf_(f64::from(x));
     // SAFETY: the title passes a valid pointer.
     unsafe { int.write(i as f32) };
@@ -303,78 +303,78 @@ fn remquo_(x: f64, y: f64) -> (f64, i32) {
     )
 }
 
-pub extern "win64" fn remquo(x: f64, y: f64, quo: *mut i32) -> f64 {
+pub extern "efiapi" fn remquo(x: f64, y: f64, quo: *mut i32) -> f64 {
     let (r, q) = remquo_(x, y);
     // SAFETY: the title passes a valid pointer.
     unsafe { quo.write(q) };
     r
 }
 
-pub extern "win64" fn remquof(x: f32, y: f32, quo: *mut i32) -> f32 {
+pub extern "efiapi" fn remquof(x: f32, y: f32, quo: *mut i32) -> f32 {
     remquo(f64::from(x), f64::from(y), quo) as f32
 }
 
 // `long` is 32 bits.
 
-pub extern "win64" fn lround(x: f64) -> i32 {
+pub extern "efiapi" fn lround(x: f64) -> i32 {
     x.round() as i32
 }
 
-pub extern "win64" fn lroundf(x: f32) -> i32 {
+pub extern "efiapi" fn lroundf(x: f32) -> i32 {
     x.round() as i32
 }
 
-pub extern "win64" fn llround(x: f64) -> i64 {
+pub extern "efiapi" fn llround(x: f64) -> i64 {
     x.round() as i64
 }
 
-pub extern "win64" fn llroundf(x: f32) -> i64 {
+pub extern "efiapi" fn llroundf(x: f32) -> i64 {
     x.round() as i64
 }
 
-pub extern "win64" fn lrint(x: f64) -> i32 {
+pub extern "efiapi" fn lrint(x: f64) -> i32 {
     x.round_ties_even() as i32
 }
 
-pub extern "win64" fn lrintf(x: f32) -> i32 {
+pub extern "efiapi" fn lrintf(x: f32) -> i32 {
     x.round_ties_even() as i32
 }
 
-pub extern "win64" fn llrint(x: f64) -> i64 {
+pub extern "efiapi" fn llrint(x: f64) -> i64 {
     x.round_ties_even() as i64
 }
 
-pub extern "win64" fn llrintf(x: f32) -> i64 {
+pub extern "efiapi" fn llrintf(x: f32) -> i64 {
     x.round_ties_even() as i64
 }
 
-pub extern "win64" fn _jn(n: i32, x: f64) -> f64 {
+pub extern "efiapi" fn _jn(n: i32, x: f64) -> f64 {
     libm::jn(n, x)
 }
 
-pub extern "win64" fn _yn(n: i32, x: f64) -> f64 {
+pub extern "efiapi" fn _yn(n: i32, x: f64) -> f64 {
     libm::yn(n, x)
 }
 
 // The `_` names and classification.
 
-pub extern "win64" fn _finite(x: f64) -> i32 {
+pub extern "efiapi" fn _finite(x: f64) -> i32 {
     i32::from(x.is_finite())
 }
 
-pub extern "win64" fn _finitef(x: f32) -> i32 {
+pub extern "efiapi" fn _finitef(x: f32) -> i32 {
     i32::from(x.is_finite())
 }
 
-pub extern "win64" fn _isnan(x: f64) -> i32 {
+pub extern "efiapi" fn _isnan(x: f64) -> i32 {
     i32::from(x.is_nan())
 }
 
-pub extern "win64" fn _isnanf(x: f32) -> i32 {
+pub extern "efiapi" fn _isnanf(x: f32) -> i32 {
     i32::from(x.is_nan())
 }
 
-pub extern "win64" fn _chgsign(x: f64) -> f64 {
+pub extern "efiapi" fn _chgsign(x: f64) -> f64 {
     -x
 }
 
@@ -393,35 +393,35 @@ fn class(x: f64, subnormal: bool) -> i32 {
     }
 }
 
-pub extern "win64" fn _dclass(x: f64) -> i32 {
+pub extern "efiapi" fn _dclass(x: f64) -> i32 {
     class(x, x.is_subnormal())
 }
 
-pub extern "win64" fn _fdclass(x: f32) -> i32 {
+pub extern "efiapi" fn _fdclass(x: f32) -> i32 {
     class(f64::from(x), x.is_subnormal())
 }
 
-pub extern "win64" fn _dtest(p: *const f64) -> i32 {
+pub extern "efiapi" fn _dtest(p: *const f64) -> i32 {
     // SAFETY: the title passes a valid pointer.
     _dclass(unsafe { p.read_unaligned() })
 }
 
-pub extern "win64" fn _fdtest(p: *const f32) -> i32 {
+pub extern "efiapi" fn _fdtest(p: *const f32) -> i32 {
     // SAFETY: the title passes a valid pointer.
     _fdclass(unsafe { p.read_unaligned() })
 }
 
 /// Nonzero (0x8000) when the sign bit is set.
-pub extern "win64" fn _dsign(x: f64) -> i32 {
+pub extern "efiapi" fn _dsign(x: f64) -> i32 {
     if x.is_sign_negative() { 0x8000 } else { 0 }
 }
 
-pub extern "win64" fn _fdsign(x: f32) -> i32 {
+pub extern "efiapi" fn _fdsign(x: f32) -> i32 {
     if x.is_sign_negative() { 0x8000 } else { 0 }
 }
 
 /// `_fpclass`: the `_FPCLASS_*` bit.
-pub extern "win64" fn _fpclass(x: f64) -> i32 {
+pub extern "efiapi" fn _fpclass(x: f64) -> i32 {
     let neg = x.is_sign_negative();
     if x.is_nan() {
         // Bit 51 set is quiet.

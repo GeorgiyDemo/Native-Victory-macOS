@@ -366,7 +366,7 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
     macro_rules! table {
         ($($f:ident),* $(,)?) => {
             match name {
-                $(stringify!($f) => Some($f as *const () as usize),)*
+                $(stringify!($f) => Some(crate::fn_addr!($f)),)*
                 _ => None,
             }
         };

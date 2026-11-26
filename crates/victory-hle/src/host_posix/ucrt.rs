@@ -5,7 +5,7 @@
 //! `wchar_t` is two bytes (UTF-16), `va_list` is a pointer to 8-byte slots,
 //! and `FILE*` is an opaque handle into our own stream table over
 //! `host_posix::files` paths. Functions with a `float` or `double` argument
-//! are `extern "win64"` (declared to the bridge), the rest are `extern
+//! are `extern "efiapi"` (declared to the bridge), the rest are `extern
 //! "system"` and the bridge remaps their integer arguments. Callbacks into
 //! title code (`qsort`, `_initterm`, `atexit`) go through `call_win64`.
 //!
@@ -179,25 +179,25 @@ macro_rules! exports {
     ($vis:vis fn $lookup:ident; $($name:ident),* $(,)?; $($alias:literal => $f:ident),* $(,)?) => {
         $vis fn $lookup(name: &str) -> Option<usize> {
             match name {
-                $(stringify!($name) => Some($name as *const () as usize),)*
-                $($alias => Some($f as *const () as usize),)*
+                $(stringify!($name) => Some(crate::fn_addr!($name)),)*
+                $($alias => Some(crate::fn_addr!($f)),)*
                 _ => None,
             }
         }
     };
 }
 
-/// As [`exports!`], for `extern "win64"` functions: each is declared to the
+/// As [`exports!`], for `extern "efiapi"` functions: each is declared to the
 /// bridge when looked up.
 macro_rules! exports64 {
     ($vis:vis fn $lookup:ident; $($name:ident),* $(,)?; $($alias:literal => $f:ident),* $(,)?) => {
         $vis fn $lookup(name: &str) -> Option<usize> {
             let address = match name {
-                $(stringify!($name) => $name as *const () as usize,)*
-                $($alias => $f as *const () as usize,)*
+                $(stringify!($name) => crate::fn_addr!($name),)*
+                $($alias => crate::fn_addr!($f),)*
                 _ => return None,
             };
-            victory_loader::native::declare_win64(address);
+            crate::title::declare_win64(address);
             Some(address)
         }
     };

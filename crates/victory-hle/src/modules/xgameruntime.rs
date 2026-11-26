@@ -338,7 +338,8 @@ mod tests {
             let f = proc(name) as usize;
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
             // SAFETY: a bridge stub of one of our functions.
-            return unsafe { victory_loader::native::call_win64(f, args) };
+            return unsafe { crate::title::call_win64(f, args) };
+            // Without a loaded title (this test) an arm64 host hands out the functions themselves.
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             // SAFETY: our functions, up to three integer arguments.
             unsafe {

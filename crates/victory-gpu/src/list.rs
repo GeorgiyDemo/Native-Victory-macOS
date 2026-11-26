@@ -1173,6 +1173,12 @@ pub(crate) fn win64_methods() -> Vec<usize> {
     Vec::new()
 }
 
+/// See [`crate::object::method_sigs`].
+pub(crate) fn method_sigs() -> Vec<(usize, &'static str)> {
+    // `clear_dsv(this, handle, flags, depth, stencil, count, rects)`.
+    vec![(clear_dsv as *const () as usize, "iiifiii>v")]
+}
+
 fn clear_dsv_impl(
     this: This,
     handle: u64,

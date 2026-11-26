@@ -20,7 +20,6 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use victory_loader::native;
 
 use super::{lock, set_error};
 
@@ -384,7 +383,7 @@ pub extern "system" fn WinHttpCloseHandle(handle: Handle) -> i32 {
         let mut closing = handle as u64;
         // SAFETY: the title's `WINHTTP_STATUS_CALLBACK`.
         unsafe {
-            native::call_win64(
+            crate::title::call_win64(
                 o.callback,
                 &[
                     handle as u64,
@@ -521,7 +520,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     macro_rules! table {
         ($($f:ident),* $(,)?) => {
             match name {
-                $(stringify!($f) => Some($f as *const () as usize),)*
+                $(stringify!($f) => Some(crate::fn_addr!($f)),)*
                 _ => None,
             }
         };

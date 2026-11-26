@@ -3,7 +3,7 @@
 //! CoreAudio.
 //!
 //! `IXAudio2` and its voices are objects whose vtables hold bridge stubs, so
-//! title code calls them directly: every method is `extern "win64"` (floats
+//! title code calls them directly: every method is `extern "efiapi"` (floats
 //! arrive in their Windows registers) behind a stub that swaps GS. The title's
 //! `IXAudio2VoiceCallback` is called from a thread of ours, off the audio
 //! thread, with the buffer notices the mixer reports.
@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
-use victory_loader::native;
 
 use super::coreaudio::{self, Opener, Output};
 use super::lock;
@@ -87,9 +86,9 @@ fn deliver(e: Event) {
         let table = (e.callback as *const *const usize).read();
         let method = table.add(slot).read();
         if e.notice == Notice::StreamEnd {
-            native::call_win64(method, &[e.callback as u64]);
+            crate::title::call_win64(method, &[e.callback as u64]);
         } else {
-            native::call_win64(method, &[e.callback as u64, e.context as u64]);
+            crate::title::call_win64(method, &[e.callback as u64, e.context as u64]);
         }
     }
 }
@@ -111,11 +110,11 @@ fn table(methods: &[usize]) -> Vec<usize> {
         return methods.to_vec();
     }
     let targets: Vec<(usize, bool)> = methods.iter().map(|&m| (m, true)).collect();
-    native::host_callbacks(&targets).expect("allocating the XAudio2 method stubs")
+    crate::title::host_callbacks(&targets).expect("allocating the XAudio2 method stubs")
 }
 
 macro_rules! methods {
-    ($($f:path),* $(,)?) => { [$($f as *const () as usize),*] };
+    ($($f:path),* $(,)?) => { [$(crate::fn_addr!($f)),*] };
 }
 
 static ENGINE_TABLE: LazyLock<Vec<usize>> = LazyLock::new(|| {
@@ -236,7 +235,7 @@ fn create_with(out: *mut *mut Engine, opener: Opener) -> HRESULT {
 
 // IUnknown and IXAudio2.
 
-extern "win64" fn engine_query_interface(
+extern "efiapi" fn engine_query_interface(
     this: *mut Engine,
     _iid: *const c_void,
     out: *mut *mut c_void,
@@ -254,12 +253,12 @@ extern "win64" fn engine_query_interface(
     S_OK
 }
 
-extern "win64" fn engine_add_ref(this: *mut Engine) -> u32 {
+extern "efiapi" fn engine_add_ref(this: *mut Engine) -> u32 {
     // SAFETY: the title's object.
     unsafe { (*this).refs.fetch_add(1, Ordering::AcqRel) + 1 }
 }
 
-extern "win64" fn engine_release(this: *mut Engine) -> u32 {
+extern "efiapi" fn engine_release(this: *mut Engine) -> u32 {
     // SAFETY: the title's object.
     let left = unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel) } - 1;
     if left == 0 {
@@ -273,35 +272,35 @@ extern "win64" fn engine_release(this: *mut Engine) -> u32 {
     left
 }
 
-extern "win64" fn engine_register(_this: *mut Engine, _callback: *mut c_void) -> HRESULT {
+extern "efiapi" fn engine_register(_this: *mut Engine, _callback: *mut c_void) -> HRESULT {
     S_OK
 }
 
-extern "win64" fn engine_unregister(_this: *mut Engine, _callback: *mut c_void) {}
+extern "efiapi" fn engine_unregister(_this: *mut Engine, _callback: *mut c_void) {}
 
-extern "win64" fn start_engine(this: *mut Engine) -> HRESULT {
+extern "efiapi" fn start_engine(this: *mut Engine) -> HRESULT {
     // SAFETY: the title's object.
     unsafe { (&*this).inner.running.store(true, Ordering::Release) };
     S_OK
 }
 
-extern "win64" fn stop_engine(this: *mut Engine) {
+extern "efiapi" fn stop_engine(this: *mut Engine) {
     // SAFETY: the title's object.
     unsafe { (&*this).inner.running.store(false, Ordering::Release) };
 }
 
-extern "win64" fn commit_changes(_this: *mut Engine, _operation_set: u32) -> HRESULT {
+extern "efiapi" fn commit_changes(_this: *mut Engine, _operation_set: u32) -> HRESULT {
     S_OK
 }
 
-extern "win64" fn get_performance_data(_this: *mut Engine, data: *mut u8) {
+extern "efiapi" fn get_performance_data(_this: *mut Engine, data: *mut u8) {
     if !data.is_null() {
         // SAFETY: an XAUDIO2_PERFORMANCE_DATA (72 bytes).
         unsafe { std::ptr::write_bytes(data, 0, 72) };
     }
 }
 
-extern "win64" fn set_debug_configuration(
+extern "efiapi" fn set_debug_configuration(
     _this: *mut Engine,
     _configuration: *const c_void,
     _reserved: *mut c_void,
@@ -366,7 +365,7 @@ fn voice_object(inner: &Arc<Inner>, vtable: &'static [usize], id: VoiceId, kind:
     }))
 }
 
-extern "win64" fn create_source_voice(
+extern "efiapi" fn create_source_voice(
     this: *mut Engine,
     out: *mut *mut Voice,
     wave: *const u8,
@@ -391,7 +390,7 @@ extern "win64" fn create_source_voice(
     S_OK
 }
 
-extern "win64" fn create_submix_voice(
+extern "efiapi" fn create_submix_voice(
     this: *mut Engine,
     out: *mut *mut Voice,
     channels: u32,
@@ -419,7 +418,7 @@ extern "win64" fn create_submix_voice(
     S_OK
 }
 
-extern "win64" fn create_mastering_voice(
+extern "efiapi" fn create_mastering_voice(
     this: *mut Engine,
     out: *mut *mut Voice,
     channels: u32,
@@ -498,7 +497,7 @@ fn with_voice<R>(
     }
 }
 
-extern "win64" fn get_voice_details(this: *mut Voice, details: *mut u32) {
+extern "efiapi" fn get_voice_details(this: *mut Voice, details: *mut u32) {
     // SAFETY: the title's voice and an XAUDIO2_VOICE_DETAILS: creation
     // flags, active flags, input channels, input sample rate.
     unsafe {
@@ -516,7 +515,7 @@ extern "win64" fn get_voice_details(this: *mut Voice, details: *mut u32) {
     }
 }
 
-extern "win64" fn set_output_voices(this: *mut Voice, sends: *const u8) -> HRESULT {
+extern "efiapi" fn set_output_voices(this: *mut Voice, sends: *const u8) -> HRESULT {
     // SAFETY: the title's voice.
     let v = unsafe { &*this };
     let output = first_send(&v.inner, sends);
@@ -537,22 +536,22 @@ extern "win64" fn set_output_voices(this: *mut Voice, sends: *const u8) -> HRESU
     S_OK
 }
 
-extern "win64" fn set_effect_chain(_this: *mut Voice, _chain: *const c_void) -> HRESULT {
+extern "efiapi" fn set_effect_chain(_this: *mut Voice, _chain: *const c_void) -> HRESULT {
     S_OK
 }
-extern "win64" fn enable_effect(_this: *mut Voice, _index: u32, _set: u32) -> HRESULT {
+extern "efiapi" fn enable_effect(_this: *mut Voice, _index: u32, _set: u32) -> HRESULT {
     S_OK
 }
-extern "win64" fn disable_effect(_this: *mut Voice, _index: u32, _set: u32) -> HRESULT {
+extern "efiapi" fn disable_effect(_this: *mut Voice, _index: u32, _set: u32) -> HRESULT {
     S_OK
 }
-extern "win64" fn get_effect_state(_this: *mut Voice, _index: u32, enabled: *mut i32) {
+extern "efiapi" fn get_effect_state(_this: *mut Voice, _index: u32, enabled: *mut i32) {
     if !enabled.is_null() {
         // SAFETY: the title's out parameter.
         unsafe { enabled.write(0) };
     }
 }
-extern "win64" fn set_effect_parameters(
+extern "efiapi" fn set_effect_parameters(
     _this: *mut Voice,
     _index: u32,
     _parameters: *const c_void,
@@ -561,7 +560,7 @@ extern "win64" fn set_effect_parameters(
 ) -> HRESULT {
     S_OK
 }
-extern "win64" fn get_effect_parameters(
+extern "efiapi" fn get_effect_parameters(
     _this: *mut Voice,
     _index: u32,
     _parameters: *mut c_void,
@@ -569,11 +568,11 @@ extern "win64" fn get_effect_parameters(
 ) -> HRESULT {
     S_OK
 }
-extern "win64" fn set_filter_parameters(_this: *mut Voice, _p: *const c_void, _set: u32) -> HRESULT {
+extern "efiapi" fn set_filter_parameters(_this: *mut Voice, _p: *const c_void, _set: u32) -> HRESULT {
     S_OK
 }
-extern "win64" fn get_filter_parameters(_this: *mut Voice, _p: *mut c_void) {}
-extern "win64" fn set_output_filter_parameters(
+extern "efiapi" fn get_filter_parameters(_this: *mut Voice, _p: *mut c_void) {}
+extern "efiapi" fn set_output_filter_parameters(
     _this: *mut Voice,
     _to: *mut Voice,
     _p: *const c_void,
@@ -581,9 +580,9 @@ extern "win64" fn set_output_filter_parameters(
 ) -> HRESULT {
     S_OK
 }
-extern "win64" fn get_output_filter_parameters(_this: *mut Voice, _to: *mut Voice, _p: *mut c_void) {}
+extern "efiapi" fn get_output_filter_parameters(_this: *mut Voice, _to: *mut Voice, _p: *mut c_void) {}
 
-extern "win64" fn set_volume(this: *mut Voice, volume: f32, _set: u32) -> HRESULT {
+extern "efiapi" fn set_volume(this: *mut Voice, volume: f32, _set: u32) -> HRESULT {
     with_voice(
         this,
         |m| m.volume = volume,
@@ -593,13 +592,13 @@ extern "win64" fn set_volume(this: *mut Voice, volume: f32, _set: u32) -> HRESUL
     S_OK
 }
 
-extern "win64" fn get_volume(this: *mut Voice, volume: *mut f32) {
+extern "efiapi" fn get_volume(this: *mut Voice, volume: *mut f32) {
     let v = with_voice(this, |m| m.volume, |s| s.volume, |s| s.volume).unwrap_or(1.0);
     // SAFETY: the title's out parameter.
     unsafe { volume.write(v) };
 }
 
-extern "win64" fn set_channel_volumes(
+extern "efiapi" fn set_channel_volumes(
     this: *mut Voice,
     count: u32,
     volumes: *const f32,
@@ -618,7 +617,7 @@ extern "win64" fn set_channel_volumes(
     S_OK
 }
 
-extern "win64" fn get_channel_volumes(this: *mut Voice, count: u32, volumes: *mut f32) {
+extern "efiapi" fn get_channel_volumes(this: *mut Voice, count: u32, volumes: *mut f32) {
     let list = with_voice(this, |_| Vec::new(), |_| Vec::new(), |s| s.channel_volumes.clone())
         .unwrap_or_default();
     for (i, v) in list.iter().take(count as usize).enumerate() {
@@ -627,7 +626,7 @@ extern "win64" fn get_channel_volumes(this: *mut Voice, count: u32, volumes: *mu
     }
 }
 
-extern "win64" fn set_output_matrix(
+extern "efiapi" fn set_output_matrix(
     this: *mut Voice,
     _to: *mut Voice,
     source_channels: u32,
@@ -649,7 +648,7 @@ extern "win64" fn set_output_matrix(
     S_OK
 }
 
-extern "win64" fn get_output_matrix(
+extern "efiapi" fn get_output_matrix(
     this: *mut Voice,
     _to: *mut Voice,
     source_channels: u32,
@@ -676,7 +675,7 @@ extern "win64" fn get_output_matrix(
     }
 }
 
-extern "win64" fn destroy_voice(this: *mut Voice) {
+extern "efiapi" fn destroy_voice(this: *mut Voice) {
     // SAFETY: made by a `create_*_voice`, destroyed once.
     let v = unsafe { Box::from_raw(this) };
     match v.kind {
@@ -690,17 +689,17 @@ extern "win64" fn destroy_voice(this: *mut Voice) {
 
 // IXAudio2SourceVoice and IXAudio2MasteringVoice.
 
-extern "win64" fn source_start(this: *mut Voice, _flags: u32, _set: u32) -> HRESULT {
+extern "efiapi" fn source_start(this: *mut Voice, _flags: u32, _set: u32) -> HRESULT {
     with_voice(this, |_| (), |_| (), |s| s.running = true);
     S_OK
 }
 
-extern "win64" fn source_stop(this: *mut Voice, _flags: u32, _set: u32) -> HRESULT {
+extern "efiapi" fn source_stop(this: *mut Voice, _flags: u32, _set: u32) -> HRESULT {
     with_voice(this, |_| (), |_| (), |s| s.running = false);
     S_OK
 }
 
-extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *const c_void) -> HRESULT {
+extern "efiapi" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *const c_void) -> HRESULT {
     if buffer.is_null() {
         return E_INVALIDARG;
     }
@@ -764,7 +763,7 @@ extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *cons
     S_OK
 }
 
-extern "win64" fn source_flush(this: *mut Voice) -> HRESULT {
+extern "efiapi" fn source_flush(this: *mut Voice) -> HRESULT {
     // SAFETY: the title's voice.
     let v = unsafe { &*this };
     let events = with_voice(this, |_| Vec::new(), |_| Vec::new(), |s| s.flush()).unwrap_or_default();
@@ -774,16 +773,16 @@ extern "win64" fn source_flush(this: *mut Voice) -> HRESULT {
     S_OK
 }
 
-extern "win64" fn source_discontinuity(_this: *mut Voice) -> HRESULT {
+extern "efiapi" fn source_discontinuity(_this: *mut Voice) -> HRESULT {
     S_OK
 }
 
-extern "win64" fn source_exit_loop(this: *mut Voice, _set: u32) -> HRESULT {
+extern "efiapi" fn source_exit_loop(this: *mut Voice, _set: u32) -> HRESULT {
     with_voice(this, |_| (), |_| (), |s| s.exit_loop());
     S_OK
 }
 
-extern "win64" fn source_get_state(this: *mut Voice, state: *mut u8, _flags: u32) {
+extern "efiapi" fn source_get_state(this: *mut Voice, state: *mut u8, _flags: u32) {
     let (context, queued, played) =
         with_voice(this, |_| (0, 0, 0), |_| (0, 0, 0), |s| s.state()).unwrap_or_default();
     // SAFETY: an XAUDIO2_VOICE_STATE: the context, the buffers queued, the
@@ -795,18 +794,18 @@ extern "win64" fn source_get_state(this: *mut Voice, state: *mut u8, _flags: u32
     }
 }
 
-extern "win64" fn source_set_ratio(this: *mut Voice, ratio: f32, _set: u32) -> HRESULT {
+extern "efiapi" fn source_set_ratio(this: *mut Voice, ratio: f32, _set: u32) -> HRESULT {
     with_voice(this, |_| (), |_| (), |s| s.ratio = ratio.clamp(1.0 / 1024.0, 1024.0));
     S_OK
 }
 
-extern "win64" fn source_get_ratio(this: *mut Voice, ratio: *mut f32) {
+extern "efiapi" fn source_get_ratio(this: *mut Voice, ratio: *mut f32) {
     let r = with_voice(this, |_| 1.0, |_| 1.0, |s| s.ratio).unwrap_or(1.0);
     // SAFETY: the title's out parameter.
     unsafe { ratio.write(r) };
 }
 
-extern "win64" fn source_set_rate(this: *mut Voice, rate: u32) -> HRESULT {
+extern "efiapi" fn source_set_rate(this: *mut Voice, rate: u32) -> HRESULT {
     if rate == 0 {
         return E_INVALIDARG;
     }
@@ -814,7 +813,7 @@ extern "win64" fn source_set_rate(this: *mut Voice, rate: u32) -> HRESULT {
     S_OK
 }
 
-extern "win64" fn master_channel_mask(this: *mut Voice, mask: *mut u32) -> HRESULT {
+extern "efiapi" fn master_channel_mask(this: *mut Voice, mask: *mut u32) -> HRESULT {
     // SAFETY: the title's voice and out parameter.
     let channels = lock(&unsafe { &*this }.inner.mixer).channels;
     let m = match channels {
@@ -836,9 +835,9 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
         return None;
     }
     match name {
-        "XAudio2Create" | "#1" => Some(XAudio2Create as *const () as usize),
+        "XAudio2Create" | "#1" => Some(crate::fn_addr!(XAudio2Create)),
         "XAudio2CreateWithVersionInfo" | "#7" => {
-            Some(XAudio2CreateWithVersionInfo as *const () as usize)
+            Some(crate::fn_addr!(XAudio2CreateWithVersionInfo))
         }
         _ => None,
     }
@@ -875,8 +874,8 @@ mod tests {
     /// The method at `slot` of an object's vtable.
     macro_rules! call {
         ($object:expr, $slot:expr, fn($($t:ty),*) -> $r:ty, $($arg:expr),*) => {{
-            // SAFETY: a vtable of `extern "win64"` methods of this signature.
-            let f: extern "win64" fn(*mut c_void $(, $t)*) -> $r = unsafe {
+            // SAFETY: a vtable of `extern "efiapi"` methods of this signature.
+            let f: extern "efiapi" fn(*mut c_void $(, $t)*) -> $r = unsafe {
                 std::mem::transmute(*(*$object.cast::<*const usize>()).add($slot))
             };
             f($object.cast() $(, $arg)*)

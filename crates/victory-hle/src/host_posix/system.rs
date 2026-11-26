@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
-use victory_loader::native::{self, seh, teb};
+use victory_loader::native::{seh, teb};
 use victory_platform::mem::{self, Protect};
 use victory_platform::sync::{Event, Semaphore};
 use victory_platform::thread;
@@ -670,6 +670,13 @@ pub extern "system" fn RtlUnwind(
     record: *mut seh::context::ExceptionRecord,
     value: u64,
 ) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (target_frame, target_ip, record, value);
+        tracing::error!("RtlUnwind: no exception unwinding on the arm64 host yet");
+        std::process::abort();
+    }
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: the title's own call; the unwinder checks what it walks.
     unsafe {
         seh::api::unwind_ex(
@@ -1200,7 +1207,7 @@ pub extern "system" fn InitOnceExecuteOnce(
     let mut result: *mut c_void = std::ptr::null_mut();
     // SAFETY: the title's own init routine, `BOOL (INIT_ONCE *, PVOID, PVOID *)`.
     let ok = unsafe {
-        native::call_win64(
+        crate::title::call_win64(
             init,
             &[once as u64, parameter as u64, &raw mut result as u64],
         )
@@ -1325,7 +1332,7 @@ fn run_callback(object: usize, delay: Duration, period: Duration, generation: Op
             }
             // SAFETY: the title's `TP_WORK_CALLBACK` or `TP_TIMER_CALLBACK`.
             unsafe {
-                native::call_win64(
+                crate::title::call_win64(
                     o.callback,
                     &[&raw const INSTANCE as u64, o.context as u64, object as u64],
                 )
@@ -1929,7 +1936,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     macro_rules! table {
         ($($f:ident),* $(,)?) => {
             match name {
-                $(stringify!($f) => Some($f as *const () as usize),)*
+                $(stringify!($f) => Some(crate::fn_addr!($f)),)*
                 _ => None,
             }
         };

@@ -146,6 +146,13 @@ pub fn set_bridge(bridge: Bridge) {
     }
 }
 
+/// Signatures (in `victory-rt`'s notation: `i` integer, `d` double, `f` float, `>`, result) of the methods
+/// that take a float by value, for hosts that cannot read them from where the Windows ABI puts them
+/// (the arm64 host); every other method is called with its integer arguments.
+pub fn method_sigs() -> Vec<(usize, &'static str)> {
+    crate::list::method_sigs()
+}
+
 /// Whether `word`, the first word of something in title memory, is `table` or its bridged copy:
 /// the test for "one of our objects".
 pub(crate) fn is_table(word: usize, table: *const *const ()) -> bool {

@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{LazyLock, Mutex};
 
-use victory_loader::native::bridge;
 use victory_loader::{ImportResolver, Resolution};
 use victory_pe::ImportSymbol;
 use victory_platform::mem::{self, Protect};
@@ -107,7 +106,7 @@ pub(crate) fn proc_address(module: *mut c_void, symbol: ImportSymbol) -> Option<
         return Some(stub as *mut c_void);
     }
     let found = match HleResolver::default().resolve(&dll, &symbol) {
-        Resolution::Found { address, .. } => bridge::stub_for(address).ok(),
+        Resolution::Found { address, .. } => crate::title::stub_for(address),
         Resolution::Missing => None,
     };
     let Some(stub) = found else {
@@ -126,7 +125,7 @@ pub(crate) fn bridged(address: usize) -> Option<usize> {
     if let Some(&stub) = lock(&PROCS).get(&key) {
         return Some(stub);
     }
-    let stub = bridge::stub_for(address).ok()?;
+    let stub = crate::title::stub_for(address)?;
     lock(&PROCS).insert(key, stub);
     Some(stub)
 }

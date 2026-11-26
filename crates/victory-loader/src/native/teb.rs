@@ -87,6 +87,7 @@ struct ThreadTeb {
 impl ThreadTeb {
     /// Builds the calling thread's TEB. Must run with the host GS base.
     fn new() -> ThreadTeb {
+        #[cfg(target_arch = "x86_64")]
         super::seh::install();
         let layout = Layout::from_size_align(TEB_SIZE, 0x1000).expect("layout");
         // SAFETY: a non-zero layout.
@@ -108,7 +109,7 @@ impl ThreadTeb {
             tls_array[i] = block as usize;
             blocks.push((block, layout));
         }
-        let (top, size) = stack_bounds();
+        let (top, size) = guest_stack_bounds();
         let put = |off: usize, v: usize| {
             // SAFETY: inside the TEB block.
             unsafe { teb.add(off).cast::<usize>().write(v) }
@@ -123,6 +124,7 @@ impl ThreadTeb {
         );
         put(OFF_TLS_ARRAY, tls_array.as_ptr() as usize);
         put(OFF_PEB, peb());
+        #[cfg(target_arch = "x86_64")]
         put(OFF_HOST_TSD, host_tsd_base());
         ThreadTeb {
             teb,
@@ -167,6 +169,7 @@ pub fn tls_slots() -> *mut usize {
     unsafe { current().add(OFF_TLS_SLOTS).cast() }
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn pthread_self() -> usize;
     fn pthread_get_stackaddr_np(thread: usize) -> usize;
@@ -174,6 +177,7 @@ unsafe extern "C" {
 }
 
 /// Top of the stack and its size.
+#[cfg(target_arch = "x86_64")]
 fn stack_bounds() -> (usize, usize) {
     // SAFETY: queries about the calling thread.
     unsafe {
@@ -182,7 +186,25 @@ fn stack_bounds() -> (usize, usize) {
     }
 }
 
+/// The stack title code runs on. Under Rosetta it is the thread's own; the arm64 host runs lifted
+/// code on a separate guest stack (`victory-rt`), which this allocates: lazily committed, never freed.
+#[cfg(target_arch = "x86_64")]
+fn guest_stack_bounds() -> (usize, usize) {
+    stack_bounds()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn guest_stack_bounds() -> (usize, usize) {
+    const GUEST_STACK: usize = 16 << 20;
+    let layout = Layout::from_size_align(GUEST_STACK, 0x4000).expect("layout");
+    // SAFETY: a non-zero layout; leaked on purpose (the TEB's stack bounds point into it).
+    let lo = unsafe { alloc_zeroed(layout) } as usize;
+    assert!(lo != 0, "out of memory for a guest stack");
+    (lo + GUEST_STACK, GUEST_STACK)
+}
+
 /// Reads `gs:[8 * slot]` of the host's thread-specific data.
+#[cfg(target_arch = "x86_64")]
 fn gs_slot(slot: usize) -> usize {
     let value: usize;
     // SAFETY: slots below 16 exist in every pthread's TSD.
@@ -198,6 +220,7 @@ fn gs_slot(slot: usize) -> usize {
 /// The TSD array sits inside the pthread structure at an offset that differs
 /// between macOS versions (and the structure holds other words equal to
 /// itself), so each candidate has to match the first words read through GS.
+#[cfg(target_arch = "x86_64")]
 fn host_tsd_base() -> usize {
     let me = gs_slot(0);
     (0..0x400)

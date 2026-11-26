@@ -772,7 +772,7 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     macro_rules! table {
         ($($f:ident),* $(,)?) => {
             match name {
-                $(stringify!($f) => Some($f as *const () as usize),)*
+                $(stringify!($f) => Some(crate::fn_addr!($f)),)*
                 _ => None,
             }
         };
@@ -821,26 +821,34 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
 /// Exceptions: `RtlCaptureContext` and `RaiseException` read the caller's
 /// registers, so they are the loader's own Windows-ABI assembly, bound with
 /// no bridge; the rest are the loader's host functions.
+#[cfg(target_arch = "aarch64")]
+fn exceptions(_name: &str) -> Option<usize> {
+    // shortcut: no exceptions on the arm64 host yet (`docs/recompiler.md`, "Exceptions"): these imports
+    // stay unresolved instead of binding to something that cannot unwind lifted frames.
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
 fn exceptions(name: &str) -> Option<usize> {
     use native::seh::api;
     let direct = |address: usize| {
-        native::declare_direct(address);
+        crate::title::declare_direct(address);
         Some(address)
     };
     match name {
         "RtlCaptureContext" => direct(api::capture_context_address()),
         "RaiseException" => direct(api::raise_exception_address()),
-        "RtlLookupFunctionEntry" => Some(api::lookup_function_entry as *const () as usize),
-        "RtlVirtualUnwind" => Some(api::virtual_unwind as *const () as usize),
-        "RtlAddFunctionTable" => Some(api::add_function_table as *const () as usize),
-        "RtlDeleteFunctionTable" => Some(api::delete_function_table as *const () as usize),
-        "RtlPcToFileHeader" => Some(api::pc_to_file_header as *const () as usize),
-        "RtlRestoreContext" => Some(api::restore_context as *const () as usize),
-        "RtlUnwindEx" => Some(api::unwind_ex as *const () as usize),
-        "__C_specific_handler" => Some(api::c_specific_handler as *const () as usize),
-        "AddVectoredExceptionHandler" => Some(api::add_vectored as *const () as usize),
-        "RemoveVectoredExceptionHandler" => Some(api::remove_vectored as *const () as usize),
-        "SetUnhandledExceptionFilter" => Some(api::set_unhandled as *const () as usize),
+        "RtlLookupFunctionEntry" => Some(crate::fn_addr!(api::lookup_function_entry)),
+        "RtlVirtualUnwind" => Some(crate::fn_addr!(api::virtual_unwind)),
+        "RtlAddFunctionTable" => Some(crate::fn_addr!(api::add_function_table)),
+        "RtlDeleteFunctionTable" => Some(crate::fn_addr!(api::delete_function_table)),
+        "RtlPcToFileHeader" => Some(crate::fn_addr!(api::pc_to_file_header)),
+        "RtlRestoreContext" => Some(crate::fn_addr!(api::restore_context)),
+        "RtlUnwindEx" => Some(crate::fn_addr!(api::unwind_ex)),
+        "__C_specific_handler" => Some(crate::fn_addr!(api::c_specific_handler)),
+        "AddVectoredExceptionHandler" => Some(crate::fn_addr!(api::add_vectored)),
+        "RemoveVectoredExceptionHandler" => Some(crate::fn_addr!(api::remove_vectored)),
+        "SetUnhandledExceptionFilter" => Some(crate::fn_addr!(api::set_unhandled)),
         _ => None,
     }
 }

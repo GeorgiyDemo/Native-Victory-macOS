@@ -41,7 +41,7 @@ macro_rules! hle_export {
     ($f:ident) => {
         $crate::HleExport {
             name: stringify!($f),
-            address: $f as *const () as usize,
+            address: $crate::fn_addr!($f),
         }
     };
 }

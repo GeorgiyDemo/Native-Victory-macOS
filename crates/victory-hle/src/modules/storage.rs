@@ -54,9 +54,9 @@ fn folder() -> Option<String> {
     }
     #[cfg(windows)]
     return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[cfg(target_os = "macos")]
     return crate::host_posix::files::mount(&storage).map(|letter| format!("{letter}:\\"));
-    #[cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     None
 }
 

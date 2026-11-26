@@ -11,13 +11,17 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+pub mod abi;
 mod host;
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 mod host_posix;
 pub mod modules;
 pub(crate) mod title;
+/// The arm64 host's side: threads, imports, objects and callbacks for recompiled title code.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use title::arm64;
 /// What the native macOS run path needs of the POSIX host: the drive table.
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(target_os = "macos")]
 pub mod posix {
     pub use crate::host_posix::files::{mount, mount_at};
     pub use crate::host_posix::ucrt::set_command_line;

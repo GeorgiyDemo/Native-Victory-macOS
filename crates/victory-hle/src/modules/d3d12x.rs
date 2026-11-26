@@ -60,24 +60,24 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             HleExport {
                 name: "D3D12ConfigureVirtualMemoryX",
-                address: device::configure_virtual_memory as *const () as usize,
+                address: crate::fn_addr!(device::configure_virtual_memory),
             },
             HleExport {
                 name: "D3D12XboxCreateDevice",
-                address: create_device as *const () as usize,
+                address: crate::fn_addr!(create_device),
             },
             HleExport {
                 name: "D3D12SerializeRootSignature",
-                address: victory_gpu::root::serialize as *const () as usize,
+                address: crate::fn_addr!(victory_gpu::root::serialize),
             },
             HleExport {
                 name: "D3D12SerializeVersionedRootSignature",
-                address: victory_gpu::root::serialize_versioned as *const () as usize,
+                address: crate::fn_addr!(victory_gpu::root::serialize_versioned),
             },
             // The AMD upscaler's (Series S).
             HleExport {
                 name: "D3D12CreateRootSignatureDeserializer",
-                address: victory_gpu::root::create_deserializer as *const () as usize,
+                address: crate::fn_addr!(victory_gpu::root::create_deserializer),
             },
             // A data import: the title reads the id at this address.
             HleExport {

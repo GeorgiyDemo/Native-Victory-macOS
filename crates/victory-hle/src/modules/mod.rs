@@ -8,7 +8,7 @@
 //! `file` (package paths), `thread` (TLS callbacks for title threads),
 //! `xaudio2`, `xstore` stubs.
 
-#[cfg(any(windows, all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod apu;
 pub mod audio;
 pub mod d3d12x;
@@ -51,6 +51,12 @@ pub mod xuser;
 
 use crate::HleModule;
 
+/// Method-table slots that take a float by value: the arm64 host calls a slot as eight integers unless told.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn note_methods() {
+    gameinput::note_methods();
+}
+
 pub(crate) fn all() -> Vec<HleModule> {
     let mut all = vec![
         kernel::module(),
@@ -61,7 +67,7 @@ pub(crate) fn all() -> Vec<HleModule> {
         dsp::module(),
         xg::module(),
     ];
-    #[cfg(any(windows, all(target_os = "macos", target_arch = "x86_64")))]
+    #[cfg(any(windows, target_os = "macos"))]
     all.push(apu::module());
     #[cfg(windows)]
     all.push(media::module());

@@ -25,6 +25,7 @@ victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
 victory-backend = { path = "crates/victory-backend" }
 victory-recomp = { path = "crates/victory-recomp" }
+victory-rt = { path = "crates/victory-rt" }
 
 # External crates
 anyhow = "1.0.104"
