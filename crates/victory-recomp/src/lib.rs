@@ -108,6 +108,9 @@ pub fn lift_image(img: &Image) -> Result<lift::Unit> {
     ))
 }
 
+/// Largest amount of x86 code (bytes) one split unit may hold.
+pub const UNIT_BYTES: usize = 600_000;
+
 /// Writes the whole image as `tu_*.c` files of `per_unit` functions, plus `table.c`, `rt.h` and
 /// `rt_host.c`, into `dir`. Returns (functions, lifted, stubbed, units).
 pub fn lift_image_split(
@@ -130,7 +133,21 @@ pub fn lift_image_split(
     let mut all: Vec<u64> = starts.iter().copied().collect();
     all.sort_unstable();
     std::fs::write(dir.join("table.c"), lift::table_unit(base, &all))?;
-    let chunks: Vec<&[(Func, Vec<Func>)]> = funcs.chunks(per_unit).collect();
+    // Units are `per_unit` functions, further cut so no unit holds more than UNIT_BYTES of x86 code
+    // (a few giant functions would otherwise make one unit take far longer than the rest).
+    let mut chunks: Vec<&[(Func, Vec<Func>)]> = vec![];
+    for part in funcs.chunks(per_unit) {
+        let (mut from, mut bytes) = (0, 0usize);
+        for (i, (f, parts)) in part.iter().enumerate() {
+            let sz = (f.end - f.begin) as usize + parts.iter().map(|p| (p.end - p.begin) as usize).sum::<usize>();
+            if i > from && bytes + sz > UNIT_BYTES {
+                chunks.push(&part[from..i]);
+                (from, bytes) = (i, 0);
+            }
+            bytes += sz;
+        }
+        chunks.push(&part[from..]);
+    }
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let (next, lifted, stubbed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     std::thread::scope(|sc| -> Result<()> {
