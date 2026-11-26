@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <setjmp.h>
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef int8_t s8; typedef int16_t s16; typedef int32_t s32; typedef int64_t s64;
 typedef union { u8 b[16]; u16 w[8]; u32 d[4]; u64 q[2]; float f[4]; double g[2]; s8 sb[16]; s16 sw[8]; s32 sd[4]; s64 sq[2]; } X128;
@@ -21,6 +22,8 @@ typedef struct {
   /* What `gs:` addresses: the thread's TEB. The lifter reads `c->gs_base + offset` for a gs: access, so the TEB
    * travels with the Cpu (an arm64 process has no free segment register). Set once per guest thread, never spilled. */
   u64 gs_base;
+  /* The guest address of the last instruction that may fault, in functions with landing pads (RT_MARK in the lifter). */
+  u64 rip;
 } Cpu;
 
 extern u8 *IMG;      /* host address of RVA 0 */
@@ -64,6 +67,25 @@ const char *rt_current_import(void);
  * given as its bit pattern), runs the guest function at `target` on the thread's guest stack (below the
  * innermost running lifted frame if called from an import) and returns rax; xmm0's low qword goes to *xmm0. */
 u64 rt_call_guest(u64 target, const u64 *args, u32 n, u32 fmask, u64 *xmm0);
+/* Exceptions (docs/recompiler.md, "Exceptions"). A lifted function with landing pads (an `__except` target) is a
+ * wrapper that records a frame (rt_frame_enter) and `_setjmp`s, around the body `fb_<rva>(c, resume)`. To resume at a
+ * pad the host calls rt_resume with the unwound registers: it finds the frame, loads the registers into its Cpu, sets
+ * rt_resume_va and longjmps; the wrapper then runs the body again with resume set, which jumps to the pad. */
+typedef struct RtFrame {
+  jmp_buf jb; struct RtFrame *prev; Cpu *c; u64 entry_rsp; Cpu *cur; const void *cur_imp;
+} RtFrame;
+extern __thread u64 rt_resume_va;
+void rt_frame_enter(RtFrame *fr, Cpu *c);
+void rt_frame_leave(RtFrame *fr);
+/* Continues at the landing pad `rip` of the innermost frame whose entry rsp is above gpr[4], with the registers of
+ * a Windows CONTEXT (rax rcx rdx rbx rsp rbp rsi rdi r8..r15; xmm0..15). Does not return. */
+void rt_resume(const u64 *gpr, const X128 *xmm, u64 rip) __attribute__((noreturn));
+/* A fault in lifted code: what the signal handler saw, and the thread's Cpu (the state at its last spill). */
+typedef struct { u32 signo, code, esr; u64 pc, addr; Cpu *run; } RtFault;
+typedef void (*RtFaultHook)(const RtFault *);
+/* Installs the signal handlers; the hook runs on the faulting thread, on its stack below the fault, and must not
+ * return (it dispatches the exception and ends in rt_resume, or aborts). */
+void rt_fault_install(RtFaultHook hook);
 /* Per-thread guest state: the TEB `gs:` addresses and the guest stack [lo, hi). A thread that never calls this
  * gets a zeroed TEB and a 1 MiB stack on first use. */
 void rt_thread_init(u8 *gs_base, u8 *stack_lo, u8 *stack_hi);

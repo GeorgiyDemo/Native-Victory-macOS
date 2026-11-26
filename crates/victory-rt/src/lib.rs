@@ -35,6 +35,8 @@ pub struct Cpu {
     pub xh: [[u8; 16]; 16],
     /// What `gs:` addresses: the thread's TEB.
     pub gs_base: u64,
+    /// The guest address of the last instruction that may fault, in functions with landing pads.
+    pub rip: u64,
 }
 
 /// Index of a general register in `Cpu::r`.
@@ -113,7 +115,11 @@ struct Rt {
     bind: Bind,
     init: Init,
     cur_import: CurImport,
+    fault_install: FaultInstall,
+    resume: Resume,
 }
+type FaultInstall = unsafe extern "C" fn(unsafe extern "C" fn(*const Fault));
+type Resume = unsafe extern "C" fn(*const u64, *const [u8; 16], u64) -> !;
 type Init = unsafe extern "C" fn(*mut u8, u64);
 type CurImport = unsafe extern "C" fn() -> *const c_char;
 type Bind = unsafe extern "C" fn(*const RtImport) -> u64;
@@ -142,6 +148,11 @@ static IMAGE_END: AtomicUsize = AtomicUsize::new(0);
 /// Whether an image is loaded: until then there is no guest to hand a function or an object to.
 pub fn is_loaded() -> bool {
     IMAGE.load(Ordering::Acquire) != 0
+}
+
+/// Where the loaded image is (0 before one is attached).
+pub fn image_base() -> usize {
+    IMAGE.load(Ordering::Acquire)
 }
 
 /// Whether `addr` is inside the loaded guest image: a callback pointer there is lifted code and must be
@@ -229,6 +240,8 @@ pub fn open(dylib: &Path) -> Result<()> {
             bind: std::mem::transmute::<*mut c_void, Bind>(sym("rt_import_bind")?),
             init: std::mem::transmute::<*mut c_void, Init>(sym("rt_init")?),
             cur_import: std::mem::transmute::<*mut c_void, CurImport>(sym("rt_current_import")?),
+            fault_install: std::mem::transmute::<*mut c_void, FaultInstall>(sym("rt_fault_install")?),
+            resume: std::mem::transmute::<*mut c_void, Resume>(sym("rt_resume")?),
         }
     };
     if RT.set(rt).is_err() {
@@ -249,6 +262,40 @@ pub unsafe fn attach_image(base: *mut u8, len: usize) -> Result<()> {
     IMAGE.store(base as usize, Ordering::Release);
     IMAGE_END.store(base as usize + len, Ordering::Release);
     Ok(())
+}
+
+/// A fault in lifted code, as the runtime's signal handler saw it (`RtFault`).
+#[repr(C)]
+pub struct Fault {
+    pub signo: u32,
+    pub code: u32,
+    /// `ESR_EL1`: the syndrome (class in bits 26..32, write-not-read in bit 6 of a data abort).
+    pub esr: u32,
+    /// The host instruction that faulted, and the address it touched.
+    pub pc: u64,
+    pub addr: u64,
+    /// The Cpu lifted code was running on: its state as of the last spill.
+    pub run: *mut Cpu,
+}
+
+/// Has the runtime catch faults in lifted code (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP) and run `hook` on the
+/// faulting thread, below the fault. The hook must not return: it ends in [`resume`] or aborts. Needs a loaded host.
+pub fn install_fault_hook(hook: unsafe extern "C" fn(*const Fault)) {
+    let rt = RT.get().expect("no host loaded");
+    // SAFETY: forwarded.
+    unsafe { (rt.fault_install)(hook) };
+}
+
+/// Continues lifted code at the landing pad `rip`: the innermost handler frame above `gpr[4]` (rsp) gets the
+/// registers (`gpr` in Windows CONTEXT order, `xmm0..15`) and runs on from the pad, dropping the host frames
+/// of everything below it. Does not return.
+///
+/// # Safety
+/// `rip` is a landing pad of a lifted function with a live frame above `gpr[4]` on this thread.
+pub unsafe fn resume(gpr: &[u64; 16], xmm: &[[u8; 16]; 16], rip: u64) -> ! {
+    let rt = RT.get().expect("no host loaded");
+    // SAFETY: forwarded.
+    unsafe { (rt.resume)(gpr.as_ptr(), xmm.as_ptr(), rip) }
 }
 
 /// Name of the import the calling thread's lifted code is inside (the runtime's `rt_current_import`), for a

@@ -109,6 +109,54 @@ impl<'a> Image<'a> {
         Some(self.bytes(unwind_rva, 1)?[0] >> 3)
     }
 
+    /// The language handler of `f` (the personality routine) and the C scope table behind it (`__try`:
+    /// begin, end, handler, jump target), if its unwind info has an exception or termination handler and the
+    /// handler data looks like such a table (a C++ frame handler's data starts differently, so it is not
+    /// read). shortcut: the handler is not checked to be `__C_specific_handler`.
+    fn scope_table(&self, f: &Func) -> Option<(u32, Vec<[u32; 4]>)> {
+        let u = f.unwind & !1;
+        let h = self.bytes(u, 4)?;
+        if f.chained || (h[0] >> 3) & 3 == 0 {
+            return None;
+        }
+        let at = u + 4 + ((h[2] as u32 + 1) & !1) * 2;
+        let handler = self.read_u32(at)?;
+        let count = self.read_u32(at + 4).filter(|c| (1..=512).contains(c))?;
+        let mut scopes = vec![];
+        for i in 0..count {
+            let e = at + 8 + i * 16;
+            let s = [self.read_u32(e)?, self.read_u32(e + 4)?, self.read_u32(e + 8)?, self.read_u32(e + 12)?];
+            if s[0] >= s[1] || !self.is_exec(s[0]) {
+                return None;
+            }
+            scopes.push(s);
+        }
+        Some((handler, scopes))
+    }
+
+    /// The landing pads of `f`: the `JumpTarget`s of its C scope table (`__except` blocks), which the
+    /// unwinder resumes at. Only targets inside the function.
+    pub fn landing_pads(&self, f: &Func) -> Vec<u32> {
+        let mut pads: Vec<u32> = self
+            .scope_table(f)
+            .into_iter()
+            .flat_map(|(_, scopes)| scopes)
+            .map(|s| s[3])
+            .filter(|j| (f.begin..f.end).contains(j))
+            .collect();
+        pads.sort_unstable();
+        pads.dedup();
+        pads
+    }
+
+    /// Code the unwinder calls that nothing in the image calls by name: the language handler of `f` (often a
+    /// thunk to an import) and the filter and termination funclets of its scope table (frameless leaves have
+    /// no `.pdata`). Seeds for code discovery.
+    pub fn handler_seeds(&self, f: &Func) -> Vec<u32> {
+        let Some((handler, scopes)) = self.scope_table(f) else { return vec![] };
+        std::iter::once(handler).chain(scopes.iter().map(|s| s[2]).filter(|&h| h > 1)).collect()
+    }
+
     /// RVAs of every `IMAGE_REL_BASED_DIR64` relocation slot.
     pub fn dir64_relocs(&self) -> Vec<u32> {
         let mut out = vec![];

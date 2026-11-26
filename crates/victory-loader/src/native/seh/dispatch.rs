@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::context::*;
 use super::unwind::{self, Bounds, RuntimeFunction, UNW_FLAG_EHANDLER, UNW_FLAG_UHANDLER};
-use crate::native::bridge::{SET_GS_BASE, call_win64};
-use crate::native::teb::{self, OFF_HOST_TSD, OFF_STACK_BASE, OFF_STACK_LIMIT};
+use crate::native::call_win64;
+use crate::native::teb::{self, OFF_STACK_BASE, OFF_STACK_LIMIT};
+#[cfg(target_arch = "x86_64")]
+use crate::native::{bridge::SET_GS_BASE, teb::OFF_HOST_TSD};
 
 /// A handler: a title's function (Windows ABI, run with the TEB) or ours.
 #[derive(Clone, Copy)]
@@ -43,6 +45,7 @@ static UNHANDLED: Mutex<Option<Handler>> = Mutex::new(None);
 /// `AddVectoredExceptionHandler`: `first` puts it ahead of the others.
 /// Returns the handle to remove it with.
 pub fn add_vectored_handler(first: bool, handler: Handler) -> usize {
+    #[cfg(target_arch = "x86_64")]
     super::install();
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) << 4;
     let mut list = VECTORED.lock().unwrap_or_else(|e| e.into_inner());
@@ -74,6 +77,7 @@ pub fn set_unhandled_filter(handler: Option<Handler>) -> Option<Handler> {
 /// frame address tells when the dispatch has been unwound past.
 struct Active {
     ctx: *mut Context,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     frame_addr: usize,
 }
 
@@ -81,6 +85,7 @@ thread_local! {
     static ACTIVE: RefCell<Vec<Active>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     // Where a faulting thread is sent: rdi = CONTEXT, rsi = EXCEPTION_RECORD,
     // GS is the TEB, rsp is 16-byte aligned.
@@ -236,6 +241,7 @@ core::arch::global_asm!(
     raise = sym raise_exception,
 );
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn victory_exception_entry();
     fn victory_restore_context(ctx: *const Context, teb: *mut u8) -> !;
@@ -244,6 +250,7 @@ unsafe extern "C" {
 }
 
 /// Where a faulting thread is redirected.
+#[cfg(target_arch = "x86_64")]
 pub(super) fn entry_address() -> usize {
     victory_exception_entry as *const () as usize
 }
@@ -251,10 +258,12 @@ pub(super) fn entry_address() -> usize {
 /// `RtlCaptureContext` and `RaiseException` for the title: the functions
 /// that read the caller's registers, in the Windows ABI, bound with no
 /// bridge.
+#[cfg(target_arch = "x86_64")]
 pub fn capture_context_address() -> usize {
     victory_RtlCaptureContext as *const () as usize
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn raise_exception_address() -> usize {
     victory_RaiseException as *const () as usize
 }
@@ -276,11 +285,33 @@ fn stack_bounds() -> Bounds {
 /// # Safety
 /// `ctx` must describe code to run on this thread's stack.
 unsafe fn resume(ctx: *const Context) -> ! {
-    // SAFETY: a valid context, per the caller.
-    let rsp = unsafe { (*ctx).gpr[RSP] } as usize;
-    ACTIVE.with(|a| a.borrow_mut().retain(|x| x.frame_addr > rsp));
-    // SAFETY: as above.
-    unsafe { victory_restore_context(ctx, teb::current()) }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: a valid context, per the caller.
+        let rsp = unsafe { (*ctx).gpr[RSP] } as usize;
+        ACTIVE.with(|a| a.borrow_mut().retain(|x| x.frame_addr > rsp));
+        // SAFETY: as above.
+        unsafe { victory_restore_context(ctx, teb::current()) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // The dispatches in progress are on host frames the resume drops; their `frame_addr`s are not
+        // comparable with a guest rsp, so all go (a dispatch begun inside a handler is forgotten).
+        ACTIVE.with(|a| a.borrow_mut().clear());
+        // SAFETY: forwarded from the caller.
+        unsafe { crate::native::guest::resume(ctx) }
+    }
+}
+
+/// Dispatches an exception raised at `ctx` (the context of the raise, or of the fault): vectored handlers,
+/// structured handling, the unhandled filter. Does not return: it continues at a handler's landing pad,
+/// at `ctx` when a handler says so, or ends the process. The arm64 host calls it from its fault hook and
+/// from `RaiseException`.
+///
+/// # Safety
+/// `ctx` and `rec` stay valid until the thread is resumed, and `ctx` is a context on this thread's guest stack.
+pub unsafe fn raise_record(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
+    dispatch_exception(ctx, rec, 0)
 }
 
 /// Runs on the host's GS base, entered from `victory_exception_entry`.
@@ -293,6 +324,7 @@ extern "C" fn dispatch_exception(ctx: *mut Context, rec: *mut ExceptionRecord, _
 }
 
 /// `RaiseException`'s dispatch, with the caller's captured `ctx`.
+#[cfg(target_arch = "x86_64")]
 extern "C" fn raise_exception(
     ctx: *mut Context,
     code: u64,
@@ -648,6 +680,7 @@ const RAX: usize = super::context::RAX;
 pub mod api {
     use super::*;
 
+    #[cfg(target_arch = "x86_64")]
     pub use super::{capture_context_address, raise_exception_address};
 
     pub extern "C" fn lookup_function_entry(

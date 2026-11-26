@@ -127,6 +127,167 @@ pub mod arm64 {
     /// runtime is loaded.
     pub fn install() {
         victory_loader::native::guest::install(call_win64);
+        victory_loader::native::guest::install_resume(resume_context);
+        victory_rt::install_fault_hook(on_fault);
+    }
+
+    // ---- exceptions: the Windows CONTEXT over the lifted `Cpu`, faults, and the two raw imports ----
+
+    use victory_loader::native::seh::context::{self as seh_context, Context, ExceptionRecord};
+    use victory_rt::{Cpu, reg};
+
+    /// Raw thunks (functions of the lifted `Cpu`): their addresses, to tell `stub_for`.
+    static RAW: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+    /// The address to serve for an import that reads the caller's registers: `stub_for` makes it a `Raw` thunk.
+    pub fn raw_export(f: unsafe extern "C" fn(*mut Cpu)) -> usize {
+        let address = f as usize;
+        lock(&RAW).get_or_insert_default().insert(address);
+        address
+    }
+
+    /// A context from the lifted registers, with the `rip` and `rsp` the caller gives.
+    fn context_of(cpu: &Cpu, rip: u64, rsp: u64) -> Context {
+        let mut c = Context::zeroed();
+        c.context_flags = seh_context::CONTEXT_FULL;
+        c.gpr = cpu.r;
+        c.gpr[seh_context::RSP] = rsp;
+        c.rip = rip;
+        for (i, x) in cpu.x.iter().enumerate() {
+            *c.xmm_mut(i) = *x;
+        }
+        c.set_mxcsr(0x1F80);
+        c.eflags = 0x246;
+        (c.seg_cs, c.seg_ds, c.seg_es, c.seg_fs, c.seg_gs, c.seg_ss) = (0x33, 0x2B, 0x2B, 0x53, 0x2B, 0x2B);
+        c
+    }
+
+    /// `RtlCaptureContext(rcx: CONTEXT *)`: the caller's registers as of the call (lifted code spills at
+    /// every call), `rip` the return address and `rsp` as after the return.
+    ///
+    /// # Safety
+    /// Called by the runtime with the `Cpu` of a lifted call.
+    pub unsafe extern "C" fn capture_context(cpu: *mut Cpu) {
+        // SAFETY: the Cpu of the call; `rcx` is the title's CONTEXT.
+        unsafe {
+            let c = &*cpu;
+            let rsp = c.r[reg::RSP];
+            let ctx = context_of(c, (rsp as *const u64).read_unaligned(), rsp + 8);
+            (c.r[reg::RCX] as *mut Context).write_unaligned(ctx);
+        }
+    }
+
+    /// `RaiseException(rcx: code, edx: flags, r8d: count, r9: arguments)`: dispatches the exception from the
+    /// caller's context. Ends in a landing pad or the unhandled path; a handler that continues execution of
+    /// a software exception is not supported (the dispatcher resumes at landing pads only).
+    ///
+    /// # Safety
+    /// Called by the runtime with the `Cpu` of a lifted call.
+    pub unsafe extern "C" fn raise_exception(cpu: *mut Cpu) {
+        // SAFETY: the Cpu of the call; the arguments are the title's.
+        unsafe {
+            let c = &*cpu;
+            let rsp = c.r[reg::RSP];
+            let ret = (rsp as *const u64).read_unaligned();
+            let mut ctx = context_of(c, ret, rsp + 8);
+            let mut rec = ExceptionRecord::new(c.r[reg::RCX] as u32, c.r[reg::RDX] as u32, ret as usize);
+            let count = (c.r[reg::R8] as usize).min(15);
+            rec.number_parameters = count as u32;
+            let args = c.r[reg::R9] as *const usize;
+            if !args.is_null() {
+                std::ptr::copy_nonoverlapping(args, rec.information.as_mut_ptr(), count);
+            }
+            victory_loader::native::seh::raise_record(&raw mut ctx, &raw mut rec)
+        }
+    }
+
+    /// Continues at an unwound context: its registers into the runtime's frame for the landing pad.
+    unsafe fn resume_context(ctx: &Context) -> ! {
+        let mut xmm = [[0u8; 16]; 16];
+        for (i, x) in xmm.iter_mut().enumerate() {
+            *x = *ctx.xmm(i);
+        }
+        // SAFETY: an unwound context at a landing pad, per the loader.
+        unsafe { victory_rt::resume(&ctx.gpr, &xmm, ctx.rip) }
+    }
+
+    #[repr(C)]
+    struct DlInfo {
+        file: *const std::ffi::c_char,
+        base: *mut std::ffi::c_void,
+        symbol: *const std::ffi::c_char,
+        address: *mut std::ffi::c_void,
+    }
+
+    unsafe extern "C" {
+        fn dladdr(address: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
+    }
+
+    /// The RVA of the lifted function (`f_<rva>`, or the body `fb_<rva>` of one with landing pads) holding
+    /// the host instruction at `pc`.
+    fn lifted_function_at(pc: u64) -> Option<u32> {
+        let mut info = DlInfo {
+            file: std::ptr::null(),
+            base: std::ptr::null_mut(),
+            symbol: std::ptr::null(),
+            address: std::ptr::null_mut(),
+        };
+        // SAFETY: a valid out pointer; the name is a NUL-terminated string owned by dyld.
+        let name = unsafe {
+            if dladdr(pc as *const _, &mut info) == 0 || info.symbol.is_null() {
+                return None;
+            }
+            std::ffi::CStr::from_ptr(info.symbol).to_str().ok()?
+        };
+        let name = name.trim_start_matches('_');
+        let hex = name.strip_prefix("fb_").or_else(|| name.strip_prefix("f_"))?;
+        u32::from_str_radix(hex, 16).ok()
+    }
+
+    /// A fault in lifted code (`victory_rt::install_fault_hook`): an exception in the faulting function.
+    ///
+    /// Lifted code keeps its registers in host registers between calls, so what is exact at a fault is the
+    /// last spill: the function's state at entry, or at its latest call (the return address on its stack is
+    /// in the function), or, in a function with landing pads, at the last instruction that could fault
+    /// (the lifter records it in `Cpu::rip`). The context is that state. A function that faults after its
+    /// prologue and before any call unwinds as if at entry.
+    unsafe extern "C" fn on_fault(f: *const victory_rt::Fault) {
+        // SAFETY: the runtime's record, and the Cpu it names.
+        let (fault, run) = unsafe { (&*f, &*(*f).run) };
+        let base = victory_rt::image_base();
+        let Some(begin) = lifted_function_at(fault.pc).map(|rva| base + rva as usize) else {
+            eprintln!("VIctory: fault at host {:#x} outside any lifted function", fault.pc);
+            std::process::abort();
+        };
+        let end = victory_loader::native::seh::unwind::lookup(begin).map_or(begin, |(_, e)| {
+            // SAFETY: an entry of an image we mapped.
+            base + unsafe { (*e).end } as usize
+        });
+        let rsp = run.r[reg::RSP];
+        // SAFETY: the guest stack as of the last spill: the return address (or entry state) is at rsp.
+        let word = unsafe { (rsp as *const u64).read_unaligned() } as usize;
+        let (rip, sp) = if (begin..end).contains(&(run.rip as usize)) {
+            (run.rip, rsp)
+        } else if (begin..end).contains(&word) {
+            (word as u64, rsp + 8)
+        } else {
+            (begin as u64, rsp)
+        };
+        let mut ctx = context_of(run, rip, sp);
+        let (code, write) = match fault.signo {
+            4 => (seh_context::EXCEPTION_ILLEGAL_INSTRUCTION, 0),
+            5 => (seh_context::EXCEPTION_BREAKPOINT, 0),
+            8 => (seh_context::EXCEPTION_FLT_DIVIDE_BY_ZERO, 0),
+            // A data abort says in bit 6 of its syndrome whether it was a write.
+            _ => (seh_context::EXCEPTION_ACCESS_VIOLATION, usize::from(fault.esr & 0x40 != 0)),
+        };
+        let mut rec = ExceptionRecord::new(code, 0, rip as usize);
+        if code == seh_context::EXCEPTION_ACCESS_VIOLATION {
+            rec.number_parameters = 2;
+            rec.information[..2].copy_from_slice(&[write, fault.addr as usize]);
+        }
+        // SAFETY: a context on this thread's guest stack, valid until the thread resumes.
+        unsafe { victory_loader::native::seh::raise_record(&raw mut ctx, &raw mut rec) }
     }
 
     /// Whether `address` is code of the title (the recompiled image, or an image the loader mapped).
@@ -155,7 +316,14 @@ pub mod arm64 {
         }
         let sig = known_sig(address).unwrap_or(DEFAULT_SIG);
         let name = format!("host@{address:#x}");
-        let binding = victory_rt::Binding::Typed(address as *const _, sig);
+        let binding = if lock(&RAW).get_or_insert_default().contains(&address) {
+            // SAFETY: registered by `raw_export` as a function of the lifted `Cpu`.
+            victory_rt::Binding::Raw(unsafe {
+                std::mem::transmute::<usize, unsafe extern "C" fn(*mut victory_rt::Cpu)>(address)
+            })
+        } else {
+            victory_rt::Binding::Typed(address as *const _, sig)
+        };
         let thunk = match victory_rt::import_thunk(&name, binding) {
             Ok(t) => t as usize,
             Err(e) => {

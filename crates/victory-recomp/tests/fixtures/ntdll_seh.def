@@ -1,0 +1,8 @@
+LIBRARY ntdll.dll
+EXPORTS
+__C_specific_handler
+AddVectoredExceptionHandler
+RaiseException
+RtlCaptureContext
+RtlLookupFunctionEntry
+RtlVirtualUnwind

@@ -14,6 +14,29 @@ pub fn install(call: GuestCall) {
     let _ = CALL.set(call);
 }
 
+/// Continues title code at a context (the registers an unwinder computed), dropping the frames of whatever was
+/// running below it. The arm64 host's runtime does it (`victory_rt::resume`).
+pub type GuestResume = unsafe fn(&super::seh::context::Context) -> !;
+
+static RESUME: OnceLock<GuestResume> = OnceLock::new();
+
+/// Installs the function that continues title code at a context. The first call wins.
+pub fn install_resume(resume: GuestResume) {
+    let _ = RESUME.set(resume);
+}
+
+/// Continues at `ctx`.
+///
+/// # Safety
+/// `ctx` is an unwound context of this thread's guest stack, at a landing pad.
+pub(crate) unsafe fn resume(ctx: *const super::seh::context::Context) -> ! {
+    let resume = RESUME
+        .get()
+        .expect("no guest resume installed (`native::guest::install_resume`)");
+    // SAFETY: forwarded.
+    unsafe { resume(&*ctx) }
+}
+
 /// Calls the Windows-ABI function `f` of a title image.
 ///
 /// # Safety

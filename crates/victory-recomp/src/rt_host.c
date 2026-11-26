@@ -5,6 +5,9 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <signal.h>
+#include <dlfcn.h>
+#include <sys/ucontext.h>
 
 u8 *IMG;
 static u64 img_size;
@@ -54,6 +57,7 @@ static RtImport imps[MAX_IMPORTS];
 static unsigned n_imps;
 static __thread const RtImport *rt_cur_imp; /* the import this thread is inside */
 static __thread Cpu *rt_cur; /* innermost Cpu of this thread's lifted code that entered the host */
+static __thread Cpu *rt_run; /* the Cpu of this thread's innermost rt_call_guest: what lifted code is running on */
 
 u64 rt_import_bind(const RtImport *m) {
   if (n_imps == MAX_IMPORTS) rt_trap("too many imports");
@@ -173,10 +177,10 @@ u64 rt_call_guest(u64 target, const u64 *args, u32 n, u32 fmask, u64 *xmm0) {
     else st64((u8 *)(sp + 8 + 8 * (u64)i), args[i]);
   }
   c.r[4] = sp;
-  Cpu *saved = rt_cur;
-  rt_cur = 0; /* the callee is the new innermost frame; an import it calls sets rt_cur itself */
+  Cpu *saved = rt_cur, *saved_run = rt_run;
+  rt_cur = 0; rt_run = &c; /* the callee is the new innermost frame; an import it calls sets rt_cur itself */
   rt_dispatch(&c, target);
-  rt_cur = saved;
+  rt_cur = saved; rt_run = saved_run;
   if (xmm0) *xmm0 = c.x[0].q[0];
   return c.r[0];
 }
@@ -226,3 +230,72 @@ void rt_cpuid(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d) {
 u64 rt_xgetbv(u32 index) { return index == 0 ? 7 : 0; } /* x87 | SSE | AVX */
 /* One tick per nanosecond, the same 1 GHz the HLE reports for the performance counter. */
 u64 rt_rdtsc(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+/* ---- exceptions: frames, resuming at a landing pad, faults in lifted code ---- */
+static __thread RtFrame *rt_frames;
+__thread u64 rt_resume_va;
+
+void rt_frame_enter(RtFrame *fr, Cpu *c) {
+  fr->prev = rt_frames; fr->c = c; fr->entry_rsp = c->r[4]; fr->cur = rt_cur; fr->cur_imp = rt_cur_imp;
+  rt_frames = fr;
+}
+void rt_frame_leave(RtFrame *fr) { rt_frames = fr->prev; }
+
+void rt_resume(const u64 *gpr, const X128 *xmm, u64 rip) {
+  /* Frames of deeper functions have their entry rsp at or below the unwound rsp; the target is the first above. */
+  RtFrame *fr = rt_frames;
+  while (fr && fr->entry_rsp <= gpr[4]) fr = fr->prev;
+  if (!fr) rt_trap("no frame to resume in");
+  Cpu *c = fr->c;
+  memcpy(c->r, gpr, sizeof c->r);
+  memcpy(c->x, xmm, sizeof c->x);
+  rt_frames = fr; rt_cur = fr->cur; rt_cur_imp = (const RtImport *)fr->cur_imp; rt_run = c;
+  rt_resume_va = rip;
+  longjmp(fr->jb, 1);
+}
+
+static RtFaultHook fault_hook;
+static __thread RtFault fault_info;
+static struct sigaction old_action[32];
+static const void *own_base;
+
+/* Runs on the faulting thread after the signal handler returned into it: the stack is the thread's own, below the
+ * fault. The guest's rsp is what the last spill says; frames for callbacks go well below it. */
+static void fault_entry(void) {
+  static __thread Cpu below;
+  below = *fault_info.run;
+  below.r[4] -= 0x10000;
+  rt_cur = &below; rt_cur_imp = 0;
+  fault_hook(&fault_info);
+  fprintf(stderr, "rt: the fault hook returned\n");
+  abort();
+}
+
+static void on_fault(int sig, siginfo_t *si, void *uctx) {
+  ucontext_t *uc = uctx;
+  u64 pc = uc->uc_mcontext->__ss.__pc, sp = uc->uc_mcontext->__ss.__sp;
+  Dl_info di;
+  /* Ours only if lifted code (this dylib) was running on a guest call. */
+  if (rt_run && fault_hook && dladdr((void *)pc, &di) && di.dli_fbase == own_base) {
+    fault_info = (RtFault){ (u32)sig, (u32)si->si_code, (u32)uc->uc_mcontext->__es.__esr, pc, (u64)si->si_addr, rt_run };
+    uc->uc_mcontext->__ss.__sp = (sp - 256) & ~15ull; /* below the red zone */
+    uc->uc_mcontext->__ss.__pc = (u64)fault_entry;
+    return;
+  }
+  /* Not ours: the previous action takes the fault again once we return (or immediately, if it was a handler). */
+  sigaction(sig, &old_action[sig], 0);
+}
+
+void rt_fault_install(RtFaultHook hook) {
+  Dl_info di;
+  if (!dladdr((void *)rt_fault_install, &di)) rt_trap("dladdr");
+  own_base = di.dli_fbase;
+  fault_hook = hook;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = on_fault;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP };
+  for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++) sigaction(sigs[i], &sa, &old_action[sigs[i]]);
+}

@@ -33,20 +33,17 @@
 pub mod context;
 pub mod unwind;
 
-#[cfg(target_arch = "x86_64")]
 mod dispatch;
 #[cfg(target_arch = "x86_64")]
 mod signal;
 
-#[cfg(target_arch = "x86_64")]
 pub use dispatch::{
-    Handler, add_vectored_handler, remove_vectored_handler, set_unhandled_filter,
+    Handler, add_vectored_handler, raise_record, remove_vectored_handler, set_unhandled_filter,
 };
 #[cfg(target_arch = "x86_64")]
 pub use signal::install;
 
 /// The functions title code calls (bound by name in `victory-hle`).
-#[cfg(target_arch = "x86_64")]
 pub mod api {
     pub use super::dispatch::api::*;
 }

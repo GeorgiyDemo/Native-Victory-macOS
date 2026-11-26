@@ -28,6 +28,8 @@ pub(crate) mod fake_dll;
 pub(crate) mod files;
 mod mf;
 mod mixer;
+#[cfg(target_arch = "aarch64")]
+mod unwinding;
 mod sync;
 mod system;
 pub(crate) mod ucrt;
@@ -818,14 +820,27 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     )
 }
 
-/// Exceptions: `RtlCaptureContext` and `RaiseException` read the caller's
-/// registers, so they are the loader's own Windows-ABI assembly, bound with
-/// no bridge; the rest are the loader's host functions.
+/// Exceptions on the arm64 host: the loader's dispatcher and unwinder over lifted frames (`seh`), and the
+/// two functions that read the caller's registers as `Raw` thunks over the `Cpu` (`title::arm64`).
 #[cfg(target_arch = "aarch64")]
-fn exceptions(_name: &str) -> Option<usize> {
-    // shortcut: no exceptions on the arm64 host yet (`docs/recompiler.md`, "Exceptions"): these imports
-    // stay unresolved instead of binding to something that cannot unwind lifted frames.
-    None
+fn exceptions(name: &str) -> Option<usize> {
+    use crate::title::arm64::raw_export;
+    Some(match name {
+        "RtlCaptureContext" => raw_export(crate::title::arm64::capture_context),
+        "RaiseException" => raw_export(crate::title::arm64::raise_exception),
+        "RtlLookupFunctionEntry" => crate::fn_addr!(unwinding::rtl_lookup_function_entry),
+        "RtlVirtualUnwind" => crate::fn_addr!(unwinding::rtl_virtual_unwind),
+        "RtlAddFunctionTable" => crate::fn_addr!(unwinding::rtl_add_function_table),
+        "RtlDeleteFunctionTable" => crate::fn_addr!(unwinding::rtl_delete_function_table),
+        "RtlPcToFileHeader" => crate::fn_addr!(unwinding::rtl_pc_to_file_header),
+        "RtlRestoreContext" => crate::fn_addr!(unwinding::rtl_restore_context),
+        "RtlUnwindEx" => crate::fn_addr!(unwinding::rtl_unwind_ex),
+        "__C_specific_handler" => crate::fn_addr!(unwinding::c_specific_handler),
+        "AddVectoredExceptionHandler" => crate::fn_addr!(unwinding::add_vectored_exception_handler),
+        "RemoveVectoredExceptionHandler" => crate::fn_addr!(unwinding::remove_vectored_exception_handler),
+        "SetUnhandledExceptionFilter" => crate::fn_addr!(unwinding::set_unhandled_exception_filter),
+        _ => return None,
+    })
 }
 
 #[cfg(target_arch = "x86_64")]

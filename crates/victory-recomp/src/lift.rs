@@ -22,6 +22,10 @@ pub struct FuncIn<'a> {
     /// Chained `.pdata` parts (cold blocks, funclets) merged into this function: `[begin, end)` VAs.
     /// Their instructions follow the parent's in `ins`, so a jump into them is a `goto`.
     pub extra: Vec<(u64, u64)>,
+    /// Addresses an unwinder resumes at (the `__except` blocks of `__try`): VAs inside the function. Such a
+    /// function gets a frame record and an entry at each, so the host can drop the frames below it and
+    /// continue there with the registers of the unwound context (`docs/recompiler.md`, "Exceptions").
+    pub landing_pads: Vec<u64>,
 }
 
 impl FuncIn<'_> {
@@ -1028,6 +1032,8 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     for ts in f.tables.values().filter(|ts| ts.iter().all(|t| ipset.contains(t))) {
         labels.extend(ts.iter().copied());
     }
+    let pads: Vec<u64> = f.landing_pads.iter().copied().filter(|p| ipset.contains(p)).collect();
+    labels.extend(pads.iter().copied());
     let y = f.ins.iter().any(uses_vector);
     let mut l = L {
         ctx,
@@ -1037,12 +1043,22 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         ips: f.ins.iter().map(|i| i.ip()).collect(),
     };
     let mut errs = vec![];
-    let _ = writeln!(
-        l.o,
-        "void {}(Cpu *c) {{ {};",
-        name(f.begin_va, ctx.image_base),
-        if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" }
-    );
+    let prologue = if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" };
+    if pads.is_empty() {
+        let _ = writeln!(l.o, "void {}(Cpu *c) {{ {prologue};", name(f.begin_va, ctx.image_base));
+    } else {
+        // The body takes `resume`: set when the host unwound to this frame, with the landing pad in
+        // `rt_resume_va` and the registers in `c`, which the prologue loads as always.
+        let _ = writeln!(
+            l.o,
+            "static void fb_{:x}(Cpu *c, int resume) {{ {prologue};\nif (resume) switch (rt_resume_va - (u64)IMG + IMAGE_BASE) {{",
+            f.begin_va - ctx.image_base
+        );
+        for p in &pads {
+            let _ = writeln!(l.o, "case {p:#x}ull: goto L_{p:x};");
+        }
+        l.o.push_str("default: rt_trap(\"bad landing pad\"); }\n");
+    }
     let mut expect = f.begin_va;
     for i in f.ins {
         if i.ip() != expect {
@@ -1053,6 +1069,16 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         if labels.contains(&i.ip()) {
             let _ = writeln!(l.o, "L_{:x}:;", i.ip());
         }
+        // In a function with landing pads a fault may be in the guarded code: record where, with every register
+        // (an access violation has only the last spill otherwise).
+        if !pads.is_empty()
+            && (matches!(i.mnemonic(), Mnemonic::Div | Mnemonic::Idiv)
+                || (!matches!(i.mnemonic(), Mnemonic::Lea | Mnemonic::Nop)
+                    && (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Memory)))
+        {
+            // The barrier keeps the compiler from moving the stores after the access that may fault.
+            let _ = writeln!(l.o, "{}; c->rip = (u64)H({:#x}ull); __asm__ volatile(\"\" ::: \"memory\");", l.sp(), i.ip());
+        }
         if let Err(e) = l.insn(i, &labels) {
             errs.push(format!("{:#x}: {e}", i.ip() - ctx.image_base));
             if !all {
@@ -1062,5 +1088,12 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     }
     // Falling off the end of a function is only legal after a non-returning call.
     l.o.push_str("rt_trap(\"fell off end of function\"); }\n");
+    if !pads.is_empty() {
+        let (n, rva) = (name(f.begin_va, ctx.image_base), f.begin_va - ctx.image_base);
+        let _ = writeln!(
+            l.o,
+            "void {n}(Cpu *c) {{ RtFrame fr; rt_frame_enter(&fr, c); if (_setjmp(fr.jb)) fb_{rva:x}(c, 1); else fb_{rva:x}(c, 0); rt_frame_leave(&fr); }}"
+        );
+    }
     (l.o, errs)
 }

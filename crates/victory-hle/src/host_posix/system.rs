@@ -670,13 +670,6 @@ pub extern "system" fn RtlUnwind(
     record: *mut seh::context::ExceptionRecord,
     value: u64,
 ) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = (target_frame, target_ip, record, value);
-        tracing::error!("RtlUnwind: no exception unwinding on the arm64 host yet");
-        std::process::abort();
-    }
-    #[cfg(target_arch = "x86_64")]
     // SAFETY: the title's own call; the unwinder checks what it walks.
     unsafe {
         seh::api::unwind_ex(

@@ -75,6 +75,10 @@ fn extra_ranges(img: &Image, parts: &[Func]) -> Vec<(u64, u64)> {
     parts.iter().map(|p| (base + p.begin as u64, base + p.end as u64)).collect()
 }
 
+fn landing_pads(img: &Image, f: &Func) -> Vec<u64> {
+    img.landing_pads(f).iter().map(|&r| img.info.image_base + r as u64).collect()
+}
+
 /// Lifts every non-chained `.pdata` function of `img` into one C unit.
 pub fn lift_image(img: &Image) -> Result<lift::Unit> {
     let funcs = group_chained(img, discover::discover(img)?);
@@ -96,6 +100,7 @@ pub fn lift_image(img: &Image) -> Result<lift::Unit> {
             ins,
             tables: tables.clone(),
             extra: extra_ranges(img, parts),
+            landing_pads: landing_pads(img, f),
         })
         .collect();
     let is_func = |va: u64| starts.contains(&va);
@@ -175,6 +180,7 @@ pub fn lift_image_split(
                                 ins,
                                 tables: tables.clone(),
                                 extra: extra_ranges(img, parts),
+                                landing_pads: landing_pads(img, f),
                             })
                             .collect();
                         let u = lift::lift_part(&ctx, &fins);
@@ -249,6 +255,7 @@ pub fn coverage(img: &Image) -> Result<Coverage> {
                             ins: &ins,
                             tables,
                             extra: extra_ranges(img, parts),
+                            landing_pads: landing_pads(img, f),
                         };
                         match lift::lift_function(ctx, &fi) {
                             Ok(_) if !bad => {

@@ -346,6 +346,7 @@ pub fn prepare(
             ins,
             tables: t.clone(),
             extra: vec![],
+            landing_pads: vec![],
         })
         .collect();
     let unit = lift_unit(

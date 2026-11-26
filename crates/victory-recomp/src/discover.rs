@@ -85,6 +85,7 @@ pub fn discover(img: &Image) -> anyhow::Result<Vec<Func>> {
         }
     }
     for f in known.iter().take(pdata_n) {
+        pending.extend(img.handler_seeds(f));
         pending.extend(walk(img, f.begin, f.end).1);
     }
     let mut starts: BTreeSet<u32> = BTreeSet::new();
